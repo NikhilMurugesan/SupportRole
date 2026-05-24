@@ -1,5 +1,135 @@
-/.venv
-/docs
-/knowledge
-/packaging
-/README.md
+# ---------------------------------------------------------------------------
+# SupportRole .gitignore
+# ---------------------------------------------------------------------------
+
+# ----- Python bytecode / caches --------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# ----- Virtual environments -------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ----- Distribution / packaging --------------------------------------------
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+wheels/
+*.whl
+*.manifest
+*.spec
+
+# PyInstaller output (packaging/build_exe.ps1)
+packaging/build/
+packaging/dist/
+packaging/*.spec
+*.exe
+
+# ----- Test / coverage / type-check caches ---------------------------------
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ----- Jupyter / IPython ---------------------------------------------------
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# ----- Logs & runtime artifacts --------------------------------------------
+*.log
+logs/
+*.pid
+*.seed
+*.dump
+
+# ----- Local config / secrets ----------------------------------------------
+.env
+.env.*
+!.env.example
+*.local
+secrets.*
+credentials.*
+config.local.*
+
+# ----- Knowledge base / vector store / models ------------------------------
+# Vector DB (Chroma) — large binary files, regenerated from source docs
+knowledge/vector_db/
+knowledge/inbox_docs/
+knowledge/processed_docs/
+*.sqlite
+*.sqlite3
+*.duckdb
+
+# Local model weights / caches
+models/
+*.gguf
+*.bin
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt
+.cache/
+.hf_cache/
+huggingface/
+torch_cache/
+
+# Audio capture / transcripts (runtime output)
+recordings/
+captures/
+transcripts/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+
+# ----- CUDA / GPU runtime --------------------------------------------------
+cuda_cache/
+*.nv
+
+# ----- IDE / editor --------------------------------------------------------
+.vscode/
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ----- OS specific ---------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ----- Memory / agent scratch ----------------------------------------------
+.memories/
+memories/
+
+# ----- Temp / scratch ------------------------------------------------------
+tmp/
+temp/
+scratch/
+*.tmp
+*.bak
+*.old

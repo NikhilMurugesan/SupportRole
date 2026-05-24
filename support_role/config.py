@@ -40,7 +40,12 @@ class AudioConfig:
     # How many speech frames before we declare speech "started".
     speech_frames_to_start: int = 2  # ~40 ms
     # Max rolling audio kept for transcription, in seconds.
-    max_audio_window_s: float = 8.0
+    # 25 s is enough to cover a long multi-question stream like
+    # "what is your RAG architecture? how did you design it? why a vector
+    # store and not a regular DB? what embeddings did you use?" spoken in
+    # one breath. Whisper medium.en on RTX 4080 SUPER transcribes 25 s in
+    # well under 1 s, so latency stays acceptable.
+    max_audio_window_s: float = 25.0
 
 
 @dataclass(frozen=True)
@@ -100,10 +105,10 @@ class LLMConfig:
     model: str = "qwen3:8b"
     # Allow a fuller answer — enough room to cover MULTIPLE questions in
     # the same utterance (e.g. "what is X and how does it differ from Y?").
-    num_predict: int = 380
-    # Bumped from 2048 → 4096 so a full 8-second multi-question utterance
-    # (~1200 chars) PLUS the RAG snippets PLUS the answer all fit in ctx.
-    num_ctx: int = 4096
+    num_predict: int = 700
+    # Bumped from 4096 → 8192 so a full ~25 s multi-question utterance
+    # (~3500 chars) PLUS the RAG snippets PLUS the answer all fit in ctx.
+    num_ctx: int = 8192
     temperature: float = 0.2
     top_p: float = 0.9
     # Cooldown (ms) between two consecutive LLM emissions. In Q&A mode this
@@ -113,11 +118,11 @@ class LLMConfig:
     # Minimum new chars in rolling buffer before we bother re-prompting.
     min_new_chars: int = 4
     # Rolling context window passed to the LLM (chars from end of transcript).
-    # Sized to cover the full ~8 s VAD window so multi-question utterances
+    # Sized to cover the full ~25 s VAD window so multi-question utterances
     # like "what is X? how does Y work? and explain Z" are sent intact —
     # otherwise only the trailing fragment reaches the LLM and earlier
     # questions in the same breath are silently dropped.
-    context_chars: int = 1200
+    context_chars: int = 3500
     # Trigger policy: ONLY fire on VAD pauses (~1 s of silence). Mid-partial
     # '?' triggers used to cause the LLM to answer garbled half-questions
     # like "The kind?" and burn 4-5 s of LLM time on noise, starving the

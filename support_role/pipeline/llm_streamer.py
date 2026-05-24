@@ -196,6 +196,15 @@ class OllamaStreamer:
         t0 = time.monotonic()
         log.info("LLM start seq=%d model=%s", prompt.seq, self.cfg.model)
 
+        def _dump(reason: str) -> None:
+            clean = _strip_thinking(accumulated).strip()
+            log.info(
+                "LLM %s seq=%d in %.0fms (%d chars)",
+                reason, prompt.seq, (time.monotonic() - t0) * 1000, len(clean),
+            )
+            for ln in (clean or "<empty>").splitlines() or ["<empty>"]:
+                log.info("LLM[%d] | %s", prompt.seq, ln)
+
         try:
             async with self._client.stream("POST", url, json=payload) as resp:
                 if resp.status_code != 200:
@@ -211,9 +220,11 @@ class OllamaStreamer:
 
                 async for line in resp.aiter_lines():
                     if stop.is_set():
+                        _dump("stopped")
                         return
                     if self.cancel_event.is_set():
                         log.info("LLM cancelled seq=%d (newer input arrived)", prompt.seq)
+                        _dump("cancelled")
                         return
                     if not line:
                         continue
@@ -254,22 +265,19 @@ class OllamaStreamer:
                         )
                         # Full answer dumped over multiple log lines so it
                         # stays readable in the console / log file.
-                        log.info(
-                            "LLM done seq=%d in %.0fms (%d chars)",
-                            prompt.seq,
-                            (time.monotonic() - t0) * 1000,
-                            len(clean),
-                        )
-                        for ln in (clean or "<empty>").splitlines() or ["<empty>"]:
-                            log.info("LLM[%d] | %s", prompt.seq, ln)
+                        _dump("done")
                         return
         except httpx.ConnectError as exc:
             log.error(
                 "Cannot reach Ollama at %s (%s). Is the Ollama service running?",
                 self.cfg.base_url, exc,
             )
+            if accumulated:
+                _dump("connect-error")
         except httpx.HTTPError:
             log.exception("Ollama HTTP error")
+            if accumulated:
+                _dump("http-error")
 
 
 def _build_user_prompt(
