@@ -1,0 +1,28 @@
+# Core realtime stack
+numpy>=1.26
+soundcard>=0.4.3            # WASAPI loopback + mic capture
+sounddevice>=0.4.6          # optional fallback capture path
+webrtcvad-wheels>=2.0.14    # prebuilt wheels for Windows / py3.12
+# UDP input mode uses only the Python stdlib `socket` module — no extra deps.
+
+# Transcription
+faster-whisper>=1.0.3
+# Torch is optional for faster-whisper (it uses CTranslate2),
+# but useful for GPU sanity checks and tokenizer utilities.
+# Install the CUDA build manually — see docs/CUDA_SETUP.md
+
+# LLM
+httpx>=0.27                 # async streaming to Ollama
+
+# Knowledge base (RAG)
+chromadb>=0.5               # persistent vector store for document chunks
+pypdf>=4.0                  # PDF text extraction
+python-docx>=1.1            # DOCX text extraction
+
+# UI
+PyQt6>=6.7
+pystray>=0.19.5
+Pillow>=10.3                # tray icon image
+
+# Async / utils
+anyio>=4.4
