@@ -139,6 +139,12 @@ class LLMConfig:
         "You are a realtime assistant. Answer the user's most recent "
         "utterance directly and helpfully, in SIMPLE spoken English that "
         "a non-expert can follow. "
+        "If a Current interview context is provided in the user prompt, "
+        "treat it as higher priority than retrieved snippets and keep the "
+        "answer in that domain. Do not invent unrelated Q&A from noisy "
+        "transcript fragments. If the latest speech is only filler or "
+        "acknowledgement and no concrete question is present, output exactly "
+        "'- Waiting for the actual question.' "
         "BUT the answer MUST also include the important technical keywords, "
         "terms, and concept names related to the topic (e.g. specific "
         "tools, APIs, algorithms, design patterns, library names). "
@@ -168,6 +174,22 @@ class LLMConfig:
 
 
 @dataclass(frozen=True)
+class OnlineLLMConfig:
+    # Runtime source selection is stored separately from this static config
+    # so the UI can switch sources without editing tracked source files.
+    default_source: Literal["local", "online"] = "local"
+
+    # Amazon Bedrock Runtime. The API key is stored in .env as
+    # AWS_BEARER_TOKEN_BEDROCK; AWS credentials/profile also continue to work.
+    bedrock_region: str = "ap-south-1"
+    bedrock_model_id: str = "openai.gpt-oss-120b-1:0"
+
+    # Local, gitignored runtime files.
+    env_file: str = ".env"
+    runtime_config_file: str = "support_role/config.local.json"
+
+
+@dataclass(frozen=True)
 class UIConfig:
     # Which window(s) to show:
     #   "main"    -> normal resizable window with transcript + hint history
@@ -175,8 +197,8 @@ class UIConfig:
     #   "both"    -> show both
     mode: Literal["main", "overlay", "both"] = "main"
 
-    width: int = 520
-    height: int = 160
+    width: int = 1040
+    height: int = 320
     margin: int = 24
     # Corner: "tr", "tl", "br", "bl"
     corner: str = "br"
@@ -257,6 +279,11 @@ class KnowledgeConfig:
     # Max chars from retrieved chunks fed to the LLM (keeps prompts small
     # so latency stays low).
     max_context_chars: int = 1800
+    # Optional per-interview profile injected into every prompt and used to
+    # bias retrieval. Edit this file before a new interview instead of
+    # relying on vector search to infer the domain from noisy speech.
+    interview_context_file: str = "knowledge/interview_context.md"
+    max_interview_context_chars: int = 4000
 
 
 @dataclass(frozen=True)
@@ -265,6 +292,7 @@ class AppConfig:
     udp: UdpConfig = field(default_factory=UdpConfig)
     whisper: WhisperConfig = field(default_factory=WhisperConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    online_llm: OnlineLLMConfig = field(default_factory=OnlineLLMConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     queues: QueueConfig = field(default_factory=QueueConfig)
     knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)

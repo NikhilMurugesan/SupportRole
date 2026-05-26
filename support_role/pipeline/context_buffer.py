@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ..config import CONFIG, LLMConfig
+from ..interview_context import load_interview_context
 from .util_queue import LatestWinsQueue
 from .transcriber import TranscriptUpdate
 
@@ -284,12 +285,21 @@ class RollingContextManager:
         if self.retriever is not None:
             t0 = time.monotonic()
             try:
+                interview_context = load_interview_context()
+                retrieval_query = rolling
+                if interview_context:
+                    retrieval_query = (
+                        "Active interview context:\n"
+                        f"{interview_context}\n\n"
+                        "Latest transcript:\n"
+                        f"{rolling}"
+                    )
                 loop = asyncio.get_running_loop()
                 # Hard cap so a stuck embed server (e.g. nomic-embed-text
                 # cold-loading) cannot freeze the whole answer pipeline.
                 chunks = await asyncio.wait_for(
                     loop.run_in_executor(
-                        None, self.retriever.retrieve, rolling
+                        None, self.retriever.retrieve, retrieval_query
                     ),
                     timeout=8.0,
                 )
