@@ -13,6 +13,7 @@ faster-whisper>=1.0.3
 
 # LLM
 httpx>=0.27                 # async streaming to Ollama
+boto3>=1.40                 # Amazon Bedrock Runtime online LLM
 
 # Knowledge base (RAG)
 chromadb>=0.5               # persistent vector store for document chunks

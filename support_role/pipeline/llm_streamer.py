@@ -1,9 +1,8 @@
-"""Streaming Ollama client.
+"""Streaming LLM client with local and Bedrock backends.
 
-Sends each fresh rolling-context prompt to the local Ollama server and
-streams tokens back as soon as they are produced. Any in-flight request
-is cancelled as soon as a newer prompt arrives, so the user always sees
-hints derived from the freshest transcript.
+Sends each fresh rolling-context prompt to the selected model source and
+streams tokens back as soon as they are produced. Local mode uses Ollama.
+Online mode uses Amazon Bedrock Runtime.
 """
 
 from __future__ import annotations
@@ -11,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -18,6 +19,8 @@ from typing import Optional
 import httpx
 
 from ..config import CONFIG, LLMConfig
+from ..interview_context import load_interview_context
+from ..llm_settings import LOCAL_SOURCE, LLMSettingsSnapshot, llm_settings
 from .context_buffer import ContextPrompt
 from .session_log import SessionLog
 from .util_queue import LatestWinsQueue
@@ -49,12 +52,11 @@ class OllamaStreamer:
         self.cfg = cfg
         self.session_log = session_log
         self._client: Optional[httpx.AsyncClient] = None
+        self._local_ready = False
 
     async def run(self, stop: asyncio.Event) -> None:
         self._client = httpx.AsyncClient(timeout=self.cfg.request_timeout_s)
-        log.info("Ollama streamer started -> %s (%s)", self.cfg.base_url, self.cfg.model)
-        await self._healthcheck()
-        await self._warmup()
+        log.info("LLM streamer started")
         last_heartbeat = time.monotonic()
         idle_since = time.monotonic()
         try:
@@ -94,12 +96,36 @@ class OllamaStreamer:
                 # Reset the cancellation flag for this generation.
                 self.cancel_event.clear()
                 try:
-                    await self._stream_one(prompt, stop)
+                    settings = llm_settings.snapshot()
+                    await self._stream_one(prompt, stop, settings)
                 except Exception:
                     log.exception("LLM stream failed")
+                    self._emit_error(
+                        prompt,
+                        "LLM request failed. Check the console log for details.",
+                    )
         finally:
-            await self._client.aclose()
+            if self._client is not None:
+                await self._client.aclose()
             self._client = None
+
+    async def _stream_one(
+        self,
+        prompt: ContextPrompt,
+        stop: asyncio.Event,
+        settings: LLMSettingsSnapshot,
+    ) -> None:
+        if settings.source == LOCAL_SOURCE:
+            await self._stream_ollama(prompt, stop)
+            return
+        await self._stream_bedrock(prompt, stop, settings)
+
+    async def _ensure_local_ready(self) -> None:
+        if self._local_ready:
+            return
+        await self._healthcheck()
+        await self._warmup()
+        self._local_ready = True
 
     # ----------------------------------------------------------- health check
     async def _healthcheck(self) -> None:
@@ -171,8 +197,9 @@ class OllamaStreamer:
             log.error("Ollama warmup failed (%s) \u2014 first prompt may be slow", exc)
 
     # --------------------------------------------------------------- streaming
-    async def _stream_one(self, prompt: ContextPrompt, stop: asyncio.Event) -> None:
+    async def _stream_ollama(self, prompt: ContextPrompt, stop: asyncio.Event) -> None:
         assert self._client is not None
+        await self._ensure_local_ready()
         payload = {
             "model": self.cfg.model,
             "stream": True,
@@ -212,13 +239,15 @@ class OllamaStreamer:
             async with self._client.stream("POST", url, json=payload) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
+                    message = body[:200].decode("utf-8", "replace")
                     log.error(
                         "Ollama HTTP %d: %s. Is `ollama serve` running and "
                         "is model '%s' pulled?",
                         resp.status_code,
-                        body[:200].decode("utf-8", "replace"),
+                        message,
                         self.cfg.model,
                     )
+                    self._emit_error(prompt, f"Local Ollama HTTP {resp.status_code}: {message[:120]}")
                     return
 
                 async for line in resp.aiter_lines():
@@ -282,8 +311,159 @@ class OllamaStreamer:
                 "Cannot reach Ollama at %s (%s). Is the Ollama service running?",
                 self.cfg.base_url, exc,
             )
-        except httpx.HTTPError:
+            self._emit_error(prompt, f"Cannot reach local Ollama at {self.cfg.base_url}.")
+        except httpx.HTTPError as exc:
             log.exception("Ollama HTTP error")
+            self._emit_error(prompt, f"Local Ollama request failed: {exc}")
+
+    async def _stream_bedrock(
+        self,
+        prompt: ContextPrompt,
+        stop: asyncio.Event,
+        settings: LLMSettingsSnapshot,
+    ) -> None:
+        if settings.bedrock_api_key:
+            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = settings.bedrock_api_key
+
+        event_q: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+        cancel_thread = threading.Event()
+        loop = asyncio.get_running_loop()
+        accumulated = ""
+        first_token_logged = False
+        t0 = time.monotonic()
+        log.info(
+            "LLM start seq=%d source=bedrock model=%s region=%s",
+            prompt.seq, settings.bedrock_model_id, settings.bedrock_region,
+        )
+
+        def worker() -> None:
+            try:
+                for token in self._bedrock_token_iter(prompt, settings, cancel_thread):
+                    loop.call_soon_threadsafe(event_q.put_nowait, ("token", token))
+                loop.call_soon_threadsafe(event_q.put_nowait, ("done", None))
+            except Exception as exc:
+                loop.call_soon_threadsafe(event_q.put_nowait, ("error", exc))
+
+        threading.Thread(target=worker, name="BedrockStream", daemon=True).start()
+
+        while not stop.is_set():
+            if self.cancel_event.is_set():
+                cancel_thread.set()
+                log.info("LLM cancelled seq=%d (newer input arrived)", prompt.seq)
+                return
+            try:
+                kind, payload = await asyncio.wait_for(event_q.get(), timeout=0.2)
+            except asyncio.TimeoutError:
+                continue
+            if kind == "token":
+                token = str(payload)
+                if not first_token_logged:
+                    log.info(
+                        "LLM first token seq=%d after %.0fms",
+                        prompt.seq, (time.monotonic() - t0) * 1000,
+                    )
+                    first_token_logged = True
+                accumulated += token
+                clean = _strip_thinking(accumulated).strip()
+                self.hint_out.put_latest(
+                    HintToken(
+                        text=token,
+                        full=clean,
+                        seq=prompt.seq,
+                        done=False,
+                        produced_at=time.monotonic(),
+                    )
+                )
+            elif kind == "done":
+                clean = _strip_thinking(accumulated).strip()
+                self._emit_done(prompt, clean, t0)
+                return
+            elif kind == "error":
+                exc = payload
+                log.error("Bedrock stream failed: %s", exc)
+                self._emit_error(prompt, f"Bedrock request failed: {exc}")
+                return
+
+    def _bedrock_token_iter(
+        self,
+        prompt: ContextPrompt,
+        settings: LLMSettingsSnapshot,
+        cancel_thread: threading.Event,
+    ):
+        try:
+            import boto3  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "boto3 is required for Amazon Bedrock. Install requirements.txt."
+            ) from exc
+
+        client = boto3.client(
+            service_name="bedrock-runtime",
+            region_name=settings.bedrock_region,
+        )
+        response = client.converse_stream(
+            modelId=settings.bedrock_model_id,
+            system=[{"text": self.cfg.system_prompt}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "text": _build_user_prompt(
+                                prompt.rolling_text,
+                                knowledge_block=prompt.knowledge_block,
+                                knowledge_hits=prompt.knowledge_hits,
+                            )
+                        }
+                    ],
+                }
+            ],
+            inferenceConfig={
+                "maxTokens": self.cfg.num_predict,
+                "temperature": self.cfg.temperature,
+                "topP": self.cfg.top_p,
+            },
+        )
+        for event in response.get("stream", []):
+            if cancel_thread.is_set():
+                break
+            delta = event.get("contentBlockDelta", {}).get("delta", {})
+            token = delta.get("text") or ""
+            if token:
+                yield token
+
+    def _emit_done(self, prompt: ContextPrompt, clean: str, t0: float) -> None:
+        self.hint_out.put_latest(
+            HintToken(
+                text="",
+                full=clean,
+                seq=prompt.seq,
+                done=True,
+                produced_at=time.monotonic(),
+            )
+        )
+        log.info(
+            "LLM done seq=%d in %.0fms (%d chars)",
+            prompt.seq,
+            (time.monotonic() - t0) * 1000,
+            len(clean),
+        )
+        for ln in (clean or "<empty>").splitlines() or ["<empty>"]:
+            log.info("LLM[%d] | %s", prompt.seq, ln)
+        if self.session_log is not None and clean:
+            self.session_log.log_answer(clean)
+
+    def _emit_error(self, prompt: ContextPrompt, message: str) -> None:
+        text = f"- {message}"
+        self.hint_out.put_latest(
+            HintToken(
+                text="",
+                full=text,
+                seq=prompt.seq,
+                done=True,
+                produced_at=time.monotonic(),
+            )
+        )
 
 
 def _build_user_prompt(
@@ -293,6 +473,17 @@ def _build_user_prompt(
     knowledge_hits: int = 0,
 ) -> str:
     parts: list[str] = []
+    interview_context = load_interview_context()
+    if interview_context:
+        parts.append(
+            "Current interview context (HIGHEST PRIORITY; use this to "
+            "disambiguate vague words like assignment, submission, router.py, "
+            "route, cost matrix, Greedy, Hungarian, truck, order, parcel, and "
+            "candidate pair. If retrieved snippets conflict with this context, "
+            "trust this context. Do not switch to unrelated AWS/GTS/UPS/RAG/ML "
+            "topics unless the live question explicitly asks for them):\n"
+            f"{interview_context}"
+        )
     if knowledge_block:
         parts.append(
             "Background reference material (use silently to ground your "
@@ -312,10 +503,14 @@ def _build_user_prompt(
         f"\"\"\"{rolling_text}\"\"\""
     )
     parts.append(
-        "Answer the most recent point or question NOW as a direct "
+        "Answer the latest concrete interview question NOW as a direct "
         "interview-style explanation with **highlighted keywords**, "
-        "following the system instructions exactly. If the utterance "
-        "contains MULTIPLE questions or requests, answer EACH ONE in "
+        "following the system instructions exactly. Ignore filler such as "
+        "'one second', 'okay', 'go ahead', 'continue', and repeated thanks "
+        "unless it is attached to a concrete question. If there is no concrete "
+        "question anywhere in the transcript, output exactly '- Waiting for "
+        "the actual question.' If the utterance contains MULTIPLE questions "
+        "or requests, answer EACH ONE in "
         "its own 'Qn:' group so nothing is skipped. Never mention "
         "source documents, filenames, PDFs, or snippet numbers."
     )
