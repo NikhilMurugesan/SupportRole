@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import QApplication
 from .config import CONFIG
 from .pipeline.context_buffer import ContextPrompt, RollingContextManager
 from .pipeline.llm_streamer import HintToken, OllamaStreamer
+from .pipeline.session_log import SessionLog
 from .pipeline.transcriber import StreamingTranscriber, TranscriptUpdate
 from .pipeline.udp_receiver import UdpAudioReceiver
 from .pipeline.util_queue import LatestWinsQueue
@@ -82,7 +83,11 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
         from .pipeline.audio_capture import LoopbackCapture
         capture = LoopbackCapture(audio_q)
     vad = StreamingVAD(audio_q, window_q)
-    transcriber = StreamingTranscriber(window_q, [transcript_q, transcript_ui_q])
+    session_log = SessionLog.for_run()
+    log.info("Session log -> %s", session_log.path)
+    transcriber = StreamingTranscriber(
+        window_q, [transcript_q, transcript_ui_q], session_log=session_log,
+    )
 
     # ---- knowledge base (RAG) ------------------------------------------
     retriever = None
@@ -111,7 +116,7 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
     context = RollingContextManager(
         transcript_q, prompt_q, cancel_event, retriever=retriever,
     )
-    llm = OllamaStreamer(prompt_q, hint_q, cancel_event)
+    llm = OllamaStreamer(prompt_q, hint_q, cancel_event, session_log=session_log)
 
     capture.start()
     try:

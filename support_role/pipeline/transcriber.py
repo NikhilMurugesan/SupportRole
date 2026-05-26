@@ -28,6 +28,7 @@ from . import cuda_bootstrap  # noqa: F401  (side-effect import)
 from faster_whisper import WhisperModel
 
 from ..config import CONFIG, WhisperConfig
+from .session_log import SessionLog
 from .util_queue import LatestWinsQueue
 from .vad import SpeechWindow, SpeechState
 
@@ -49,8 +50,10 @@ class StreamingTranscriber:
         window_in: LatestWinsQueue[SpeechWindow],
         transcript_out: "LatestWinsQueue[TranscriptUpdate] | list[LatestWinsQueue[TranscriptUpdate]]",
         cfg: WhisperConfig = CONFIG.whisper,
+        session_log: Optional[SessionLog] = None,
     ) -> None:
         self.window_in = window_in
+        self.session_log = session_log
         # Allow fan-out: an asyncio.Queue can only deliver each item to ONE
         # waiter, so if both the context manager and the UI pump shared a
         # single transcript queue they would race — the PAUSE final could
@@ -198,6 +201,8 @@ class StreamingTranscriber:
                     "*** Transcriber put FINAL transcript seq=%d -> %d queue(s) [%s] ***",
                     window.seq, len(self.transcript_outs), sizes,
                 )
+                if self.session_log is not None:
+                    self.session_log.log_transcript(text)
                 log.info(
                     "Transcriber loop continuing after FINAL seq=%d (back to await window_in.get)",
                     window.seq,

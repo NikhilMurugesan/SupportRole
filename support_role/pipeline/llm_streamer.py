@@ -19,6 +19,7 @@ import httpx
 
 from ..config import CONFIG, LLMConfig
 from .context_buffer import ContextPrompt
+from .session_log import SessionLog
 from .util_queue import LatestWinsQueue
 
 log = logging.getLogger(__name__)
@@ -40,11 +41,13 @@ class OllamaStreamer:
         hint_out: LatestWinsQueue[HintToken],
         cancel_event: asyncio.Event,
         cfg: LLMConfig = CONFIG.llm,
+        session_log: Optional[SessionLog] = None,
     ) -> None:
         self.prompt_in = prompt_in
         self.hint_out = hint_out
         self.cancel_event = cancel_event
         self.cfg = cfg
+        self.session_log = session_log
         self._client: Optional[httpx.AsyncClient] = None
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -220,11 +223,9 @@ class OllamaStreamer:
 
                 async for line in resp.aiter_lines():
                     if stop.is_set():
-                        _dump("stopped")
                         return
                     if self.cancel_event.is_set():
                         log.info("LLM cancelled seq=%d (newer input arrived)", prompt.seq)
-                        _dump("cancelled")
                         return
                     if not line:
                         continue
@@ -265,19 +266,24 @@ class OllamaStreamer:
                         )
                         # Full answer dumped over multiple log lines so it
                         # stays readable in the console / log file.
-                        _dump("done")
+                        log.info(
+                            "LLM done seq=%d in %.0fms (%d chars)",
+                            prompt.seq,
+                            (time.monotonic() - t0) * 1000,
+                            len(clean),
+                        )
+                        for ln in (clean or "<empty>").splitlines() or ["<empty>"]:
+                            log.info("LLM[%d] | %s", prompt.seq, ln)
+                        if self.session_log is not None and clean:
+                            self.session_log.log_answer(clean)
                         return
         except httpx.ConnectError as exc:
             log.error(
                 "Cannot reach Ollama at %s (%s). Is the Ollama service running?",
                 self.cfg.base_url, exc,
             )
-            if accumulated:
-                _dump("connect-error")
         except httpx.HTTPError:
             log.exception("Ollama HTTP error")
-            if accumulated:
-                _dump("http-error")
 
 
 def _build_user_prompt(

@@ -83,6 +83,12 @@ class RollingContextManager:
         self._last_sent_text = ""
         self._latest: Optional[TranscriptUpdate] = None
         self._latest_at: float = 0.0
+        # All partial transcripts seen since the last PAUSE. Whisper's
+        # rolling 8-second audio window means later partials can drift
+        # (or hallucinate) as the early audio scrolls off the left. The
+        # cleanest version of the question is often an EARLIER partial,
+        # not the final one. We keep them all and pick the best on PAUSE.
+        self._utterance_partials: list[str] = []
 
     async def run(self, stop: asyncio.Event) -> None:
         cooldown_s = self.cfg.debounce_ms / 1000.0
@@ -139,6 +145,28 @@ class RollingContextManager:
 
             text = self._latest.text.strip()
             is_pause = not self._latest.is_partial
+            # On PAUSE, the Whisper-of-the-final-window can be heavily
+            # drifted (the start of the question has scrolled out of
+            # the 8 s rolling audio buffer). Recover by replacing it
+            # with the cleanest partial we saw during the utterance.
+            if is_pause:
+                better = self._pick_best_utterance_text(text)
+                if better != text:
+                    log.info(
+                        "Context: replacing drifted final with best "
+                        "utterance partial (%d->%d chars, %d q-marks)",
+                        len(text), len(better), better.count("?"),
+                    )
+                    # Mutate the latest update's text in-place so the
+                    # downstream emit uses the cleaner version.
+                    self._latest = TranscriptUpdate(
+                        text=better,
+                        is_partial=self._latest.is_partial,
+                        seq=self._latest.seq,
+                        speech_state=self._latest.speech_state,
+                        produced_at=self._latest.produced_at,
+                    )
+                    text = better
             ends_with_q = text.endswith("?")
 
             # Trigger gate:
@@ -186,11 +214,50 @@ class RollingContextManager:
                 emitted = False
             if emitted:
                 last_emit_at = now
+            # PAUSE closes the utterance regardless of whether we
+            # actually emitted (e.g. cooldown). Reset history so the
+            # next utterance is scored from scratch.
+            if is_pause:
+                self._utterance_partials.clear()
 
     # ----------------------------------------------------------------- helpers
     def _on_update(self, update: TranscriptUpdate) -> None:
         self._latest = update
         self._latest_at = time.monotonic()
+        # Track every distinct partial text seen during the current
+        # utterance so we can recover from end-of-window drift on PAUSE.
+        text = update.text.strip()
+        if text and (
+            not self._utterance_partials
+            or self._utterance_partials[-1] != text
+        ):
+            self._utterance_partials.append(text)
+        # Cap memory — an utterance shouldn't accumulate hundreds of
+        # partials, but be defensive in case of a stuck SPEAKING state.
+        if len(self._utterance_partials) > 200:
+            self._utterance_partials = self._utterance_partials[-200:]
+
+    @staticmethod
+    def _score_partial(text: str) -> tuple:
+        """Higher tuple = better candidate. Prefer transcripts that
+        contain question marks (sign of a complete question), then those
+        ending with sentence punctuation, then longer ones."""
+        q_count = text.count("?")
+        ends_clean = 1 if text.rstrip().endswith(("?", ".", "!")) else 0
+        return (q_count, ends_clean, len(text))
+
+    def _pick_best_utterance_text(self, fallback: str) -> str:
+        """On PAUSE, choose the cleanest transcript from the utterance
+        history instead of trusting the final (often most-drifted) one."""
+        if not self._utterance_partials:
+            return fallback
+        best = max(self._utterance_partials, key=self._score_partial)
+        # Only override the final if the best candidate is meaningfully
+        # better — avoids replacing a good final with a near-identical
+        # earlier partial.
+        if self._score_partial(best) > self._score_partial(fallback):
+            return best
+        return fallback
 
     async def _emit_with_rag(self, *, force: bool = False) -> bool:
         if self._latest is None:
