@@ -15,11 +15,10 @@ from typing import Literal, Optional
 class AudioConfig:
     # Where to record from:
     #   "loopback" -> captures system speaker output (Zoom, YouTube, etc.)
-    #   "mic"      -> captures your default microphone
     #   "udp"      -> receives int16 PCM packets over UDP (see UdpConfig)
-    input_mode: Literal["loopback", "mic", "udp"] = "udp"
+    input_mode: Literal["loopback", "udp"] = "udp"
     # Optional: pick a specific device by (sub-)name. None = system default.
-    # Examples: "Headset Microphone", "Speakers (Realtek", "BlackHole".
+    # Examples: "Speakers (Realtek", "BlackHole".
     device_name: Optional[str] = None
 
     # WebRTC VAD only supports 8/16/32/48 kHz mono int16. We resample to 16 kHz.
@@ -140,11 +139,14 @@ class LLMConfig:
         "utterance directly and helpfully, in SIMPLE spoken English that "
         "a non-expert can follow. "
         "If a Current interview context is provided in the user prompt, "
-        "treat it as higher priority than retrieved snippets and keep the "
-        "answer in that domain. Do not invent unrelated Q&A from noisy "
-        "transcript fragments. If the latest speech is only filler or "
-        "acknowledgement and no concrete question is present, output exactly "
-        "'- Waiting for the actual question.' "
+        "use it as domain background, but the live paused transcript is the "
+        "current request and has priority. When a silence pause triggers a "
+        "prompt, answer immediately with the best useful response; do not wait "
+        "for a question mark or return a waiting placeholder. If the latest "
+        "speech is a statement or fragment, infer the likely interview prompt "
+        "and explain the relevant concept. If it is only filler or an "
+        "acknowledgement, give one short useful acknowledgement instead of "
+        "waiting. "
         "BUT the answer MUST also include the important technical keywords, "
         "terms, and concept names related to the topic (e.g. specific "
         "tools, APIs, algorithms, design patterns, library names). "

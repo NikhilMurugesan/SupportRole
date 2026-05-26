@@ -24,10 +24,9 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
 from PyQt6.QtWidgets import QApplication
 
 from .config import CONFIG
@@ -80,71 +79,13 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
 
     if CONFIG.audio.input_mode == "udp":
         capture = UdpAudioReceiver(audio_q)
-    else:
+    elif CONFIG.audio.input_mode == "loopback":
         # Lazy import: `soundcard` initializes COM, which conflicts with Qt
         # on the main thread when we don't actually need it.
         from .pipeline.audio_capture import LoopbackCapture
         capture = LoopbackCapture(audio_q)
-
-    mic_capture = None
-    mic_active = False
-
-    def _emit_mic_status(active: bool, message: str) -> None:
-        if ui.main is not None:
-            ui.main.mic_status_signal.emit(active, message)
-
-    def _flush_mic_silence() -> None:
-        chunk_samples = int(
-            CONFIG.audio.sample_rate * CONFIG.audio.capture_chunk_ms / 1000
-        )
-        pause_ms = (
-            CONFIG.audio.silence_frames_for_pause * CONFIG.audio.vad_frame_ms
-            + CONFIG.audio.capture_chunk_ms
-        )
-        chunks = max(
-            1,
-            int((pause_ms + CONFIG.audio.capture_chunk_ms - 1)
-                / CONFIG.audio.capture_chunk_ms),
-        )
-        silence = np.zeros(chunk_samples, dtype=np.float32)
-        for _ in range(chunks):
-            audio_q.put_latest(silence.copy())
-
-    def _set_mic_active(active: bool) -> None:
-        nonlocal mic_capture, mic_active
-        if active == mic_active:
-            _emit_mic_status(mic_active, "Mic already " + ("on" if mic_active else "off"))
-            return
-        try:
-            if active:
-                from .pipeline.audio_capture import LoopbackCapture
-                mic_cfg = replace(CONFIG.audio, input_mode="mic", device_name=None)
-                mic_capture = LoopbackCapture(audio_q, cfg=mic_cfg)
-                mic_capture.start()
-                mic_active = True
-                _emit_mic_status(True, "Mic active (alongside main input)")
-            else:
-                if mic_capture is not None:
-                    mic_capture.stop()
-                    mic_capture = None
-                _flush_mic_silence()
-                mic_active = False
-                _emit_mic_status(False, "Mic stopped")
-        except Exception as exc:
-            log.exception("Mic toggle failed")
-            mic_active = False
-            if mic_capture is not None:
-                try:
-                    mic_capture.stop()
-                except Exception:
-                    pass
-                mic_capture = None
-            _emit_mic_status(False, f"Mic failed: {exc}")
-
-    if ui.main is not None:
-        ui.main.mic_request_signal.connect(
-            lambda active: loop.call_soon_threadsafe(_set_mic_active, active)
-        )
+    else:
+        raise ValueError(f"Unknown input_mode: {CONFIG.audio.input_mode!r}")
 
     vad = StreamingVAD(audio_q, window_q)
     session_log = SessionLog.for_run()
@@ -187,10 +128,12 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
 
     def _on_text_input(text: str) -> None:
         _text_seq[0] -= 1
+        seq = _text_seq[0]
+        log.info("Text input -> LLM prompt seq=%d (%d chars)", seq, len(text))
         if session_log is not None:
             session_log.log_transcript(text)
         prompt_q.put_latest(ContextPrompt(
-            rolling_text=text, seq=_text_seq[0], produced_at=time.monotonic(),
+            rolling_text=text, seq=seq, produced_at=time.monotonic(),
         ))
 
     if ui.main is not None:
@@ -209,10 +152,6 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
         ]
         if indexer is not None:
             tasks.append(asyncio.create_task(indexer.run(stop), name="indexer"))
-        _emit_mic_status(
-            mic_active,
-            "Mic active" if mic_active else "Mic off",
-        )
         done, pending = await asyncio.wait(
             tasks, return_when=asyncio.FIRST_EXCEPTION
         )
@@ -223,8 +162,6 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
                 log.error("Task %s crashed: %r", t.get_name(), exc)
     finally:
         capture.stop()
-        if mic_capture is not None:
-            mic_capture.stop()
         transcriber.shutdown()
 
 

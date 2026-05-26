@@ -1,6 +1,6 @@
 # Core realtime stack
 numpy>=1.26
-soundcard>=0.4.3            # WASAPI loopback + mic capture
+soundcard>=0.4.3            # WASAPI loopback capture
 sounddevice>=0.4.6          # optional fallback capture path
 webrtcvad-wheels>=2.0.14    # prebuilt wheels for Windows / py3.12
 # UDP input mode uses only the Python stdlib `socket` module — no extra deps.

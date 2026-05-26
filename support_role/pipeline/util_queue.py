@@ -46,6 +46,13 @@ class LatestWinsQueue(Generic[T]):
             # Fall back to direct put if we're on the same loop already.
             self._direct_put_latest(item)
             return
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            self._direct_put_latest(item)
+            return
         loop.call_soon_threadsafe(self._direct_put_latest, item)
 
     def _direct_put_latest(self, item: T) -> None:

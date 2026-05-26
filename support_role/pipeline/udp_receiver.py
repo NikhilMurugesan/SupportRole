@@ -10,7 +10,7 @@ We:
   * resample 48 kHz -> 16 kHz (integer 3x decimation with averaging),
   * convert to float32 in [-1, 1],
   * push fixed-size chunks (matching AudioConfig.capture_chunk_ms) into the
-    same `LatestWinsQueue` that the loopback/mic capture uses, so the rest
+    same `LatestWinsQueue` that loopback capture uses, so the rest
     of the pipeline is unchanged.
 """
 
