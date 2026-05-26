@@ -23,6 +23,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -86,7 +87,7 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
         capture = LoopbackCapture(audio_q)
 
     mic_capture = None
-    mic_active = CONFIG.audio.input_mode == "mic"
+    mic_active = False
 
     def _emit_mic_status(active: bool, message: str) -> None:
         if ui.main is not None:
@@ -111,46 +112,33 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
 
     def _set_mic_active(active: bool) -> None:
         nonlocal mic_capture, mic_active
-        log.info("Mic toggle requested: active=%s current=%s", active, mic_active)
-        if CONFIG.audio.input_mode == "mic":
-            mic_active = True
-            _emit_mic_status(True, "Mic is already the configured input")
-            return
         if active == mic_active:
-            _emit_mic_status(
-                mic_active, "Mic already active" if mic_active else "Mic already off"
-            )
+            _emit_mic_status(mic_active, "Mic already " + ("on" if mic_active else "off"))
             return
         try:
             if active:
                 from .pipeline.audio_capture import LoopbackCapture
-                log.info("Switching audio capture to microphone")
-                capture.stop()
-                mic_cfg = replace(
-                    CONFIG.audio, input_mode="mic", device_name=None
-                )
-                if mic_capture is None:
-                    mic_capture = LoopbackCapture(audio_q, cfg=mic_cfg)
+                mic_cfg = replace(CONFIG.audio, input_mode="mic", device_name=None)
+                mic_capture = LoopbackCapture(audio_q, cfg=mic_cfg)
                 mic_capture.start()
                 mic_active = True
-                _emit_mic_status(True, "Mic active")
-                return
-
-            if mic_capture is not None:
-                log.info("Stopping microphone capture")
-                mic_capture.stop()
-            _flush_mic_silence()
-            log.info("Restoring configured audio capture: %s", CONFIG.audio.input_mode)
-            capture.start()
-            mic_active = False
-            _emit_mic_status(False, "Mic stopped; processing speech")
+                _emit_mic_status(True, "Mic active (alongside main input)")
+            else:
+                if mic_capture is not None:
+                    mic_capture.stop()
+                    mic_capture = None
+                _flush_mic_silence()
+                mic_active = False
+                _emit_mic_status(False, "Mic stopped")
         except Exception as exc:
             log.exception("Mic toggle failed")
             mic_active = False
-            try:
-                capture.start()
-            except Exception:
-                log.exception("Failed to restart configured capture")
+            if mic_capture is not None:
+                try:
+                    mic_capture.stop()
+                except Exception:
+                    pass
+                mic_capture = None
             _emit_mic_status(False, f"Mic failed: {exc}")
 
     if ui.main is not None:
@@ -194,8 +182,23 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
     )
     llm = OllamaStreamer(prompt_q, hint_q, cancel_event, session_log=session_log)
 
-    if not mic_active:
-        capture.start()
+    # ---- text input from UI -> direct LLM prompt injection ----
+    _text_seq = [-1000]
+
+    def _on_text_input(text: str) -> None:
+        _text_seq[0] -= 1
+        if session_log is not None:
+            session_log.log_transcript(text)
+        prompt_q.put_latest(ContextPrompt(
+            rolling_text=text, seq=_text_seq[0], produced_at=time.monotonic(),
+        ))
+
+    if ui.main is not None:
+        ui.main.text_input_signal.connect(
+            lambda text: loop.call_soon_threadsafe(_on_text_input, text)
+        )
+
+    capture.start()
     try:
         tasks = [
             asyncio.create_task(vad.run(stop), name="vad"),
@@ -232,7 +235,6 @@ async def _ui_pump(
     stop: asyncio.Event,
 ) -> None:
     """Fan transcript + hint updates out to Qt signals on every active window."""
-    import time
 
     async def pump_transcript():
         last_warn = time.monotonic()
@@ -268,7 +270,7 @@ async def _ui_pump(
             # confirm hints are reaching the UI.
             if tok.done or first_seq != tok.seq:
                 first_seq = tok.seq
-                log.info(
+                log.debug(
                     "UI <- hint seq=%d done=%s (%d chars): %r",
                     tok.seq, tok.done, len(tok.full),
                     (tok.full[:80] + "…") if len(tok.full) > 80 else tok.full,
@@ -307,7 +309,7 @@ def _create_ui() -> tuple[QApplication, UIHandles]:
 
 def run(debug: bool = False) -> int:
     logging.basicConfig(
-        level=logging.DEBUG if debug else logging.INFO,
+        level=logging.DEBUG if debug else logging.WARNING,
         format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
         stream=sys.stderr,

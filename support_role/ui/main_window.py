@@ -99,6 +99,12 @@ QComboBox {
     border-radius: 6px; padding: 4px 10px; min-width: 116px;
 }
 QComboBox:disabled { color: #6f7a8c; background: #1b1e26; }
+QLineEdit#textInput {
+    background: #1c1f26; color: #e6e9ef;
+    border: 1px solid #2e3340; border-radius: 6px;
+    padding: 6px 10px; font-size: 14px;
+}
+QLineEdit#textInput:focus { border: 1px solid #3a4b66; }
 QStatusBar { color: #8a93a3; }
 """
 
@@ -182,6 +188,7 @@ class MainWindow(QMainWindow):
     hint_signal = pyqtSignal(str, bool, int)      # (full_text, done, seq)
     mic_request_signal = pyqtSignal(bool)         # requested active state
     mic_status_signal = pyqtSignal(bool, str)     # actual active state, status
+    text_input_signal = pyqtSignal(str)           # user-typed question text
 
     def __init__(self) -> None:
         super().__init__()
@@ -247,6 +254,19 @@ class MainWindow(QMainWindow):
         self.cards_layout.addStretch(1)  # pushes existing cards to the top
         self.scroll.setWidget(self.card_host)
         root.addWidget(self.scroll, 1)
+
+        # ---- text input row
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+        self.text_input = QLineEdit(self)
+        self.text_input.setObjectName("textInput")
+        self.text_input.setPlaceholderText("Type a question and press Enter...")
+        self.send_btn = QPushButton("Send", self)
+        self.text_input.returnPressed.connect(self._on_text_submit)
+        self.send_btn.clicked.connect(self._on_text_submit)
+        input_row.addWidget(self.text_input, 1)
+        input_row.addWidget(self.send_btn)
+        root.addLayout(input_row)
 
         # ---- action bar
         actions = QHBoxLayout()
@@ -337,6 +357,15 @@ class MainWindow(QMainWindow):
         card.mark_done(latency_ms)
         self._active_seq = None
         self._update_status(f"Answer ready  ({latency_ms} ms)")
+
+    def _on_text_submit(self) -> None:
+        text = self.text_input.text().strip()
+        if not text:
+            return
+        self.text_input.clear()
+        self.live_transcript.setText(text)
+        self.text_input_signal.emit(text)
+        self._update_status("Sent typed question")
 
     def _on_mic_toggled(self, active: bool) -> None:
         if self._syncing_mic:

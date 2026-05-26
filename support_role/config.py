@@ -31,14 +31,14 @@ class AudioConfig:
     # VAD frame size (must be 10/20/30 ms for webrtcvad).
     vad_frame_ms: int = 20
     # 0 (least aggressive) ... 3 (most aggressive at filtering non-speech).
-    vad_aggressiveness: int = 2
+    vad_aggressiveness: int = 3
     # How many silent VAD frames before we declare a "pause".
     # How many silent VAD frames before we declare a "pause".
     # 50 frames * 20 ms = ~1000 ms — matches the "any pause >1 s should
     # trigger an answer" requirement.
     silence_frames_for_pause: int = 50
     # How many speech frames before we declare speech "started".
-    speech_frames_to_start: int = 2  # ~40 ms
+    speech_frames_to_start: int = 8  # ~160 ms
     # Max rolling audio kept for transcription, in seconds.
     # 25 s is enough to cover a long multi-question stream like
     # "what is your RAG architecture? how did you design it? why a vector

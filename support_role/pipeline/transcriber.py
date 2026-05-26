@@ -143,8 +143,8 @@ class StreamingTranscriber:
             # Speaking-window pulls are extremely frequent. Quiet to DEBUG.
             # A PAUSED window pull is the critical end-of-utterance event.
             if window.state == SpeechState.PAUSED:
-                log.info(
-                    "*** Transcriber got PAUSE window seq=%d samples=%d (drained=%d, qsize=%d) ***",
+                log.debug(
+                    "Transcriber got PAUSE window seq=%d samples=%d (drained=%d, qsize=%d)",
                     window.seq, window.audio.size,
                     drained, self.window_in.qsize(),
                 )
@@ -156,7 +156,7 @@ class StreamingTranscriber:
                 )
 
             if window.audio.size == 0:
-                log.info("Transcriber: empty window seq=%d, skipping", window.seq)
+                log.debug("Transcriber: empty window seq=%d, skipping", window.seq)
                 continue
 
             text = await loop.run_in_executor(
@@ -178,7 +178,7 @@ class StreamingTranscriber:
             self._last_text = text
             self._last_emit_seq = window.seq
             preview = text if len(text) <= 90 else text[:87] + "..."
-            log.info(
+            log.debug(
                 "Whisper -> '%s'  (partial=%s, state=%s, %d samples)",
                 preview, is_partial, window.state.value, window.audio.size,
             )
@@ -197,14 +197,14 @@ class StreamingTranscriber:
                 sizes = ", ".join(
                     f"{q.qsize()}/{q.maxsize()}" for q in self.transcript_outs
                 )
-                log.info(
-                    "*** Transcriber put FINAL transcript seq=%d -> %d queue(s) [%s] ***",
+                log.debug(
+                    "Transcriber put FINAL transcript seq=%d -> %d queue(s) [%s]",
                     window.seq, len(self.transcript_outs), sizes,
                 )
                 if self.session_log is not None:
                     self.session_log.log_transcript(text)
-                log.info(
-                    "Transcriber loop continuing after FINAL seq=%d (back to await window_in.get)",
+                log.debug(
+                    "Transcriber loop continuing after FINAL seq=%d",
                     window.seq,
                 )
 

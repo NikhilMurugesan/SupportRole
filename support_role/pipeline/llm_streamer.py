@@ -66,7 +66,7 @@ class OllamaStreamer:
                 except asyncio.TimeoutError:
                     now = time.monotonic()
                     if now - last_heartbeat >= 5.0:
-                        log.info(
+                        log.debug(
                             "LLM HEARTBEAT (idle %.1fs, prompt_qsize=%d, waiting for prompt)",
                             now - idle_since, self.prompt_in.qsize(),
                         )
@@ -74,7 +74,7 @@ class OllamaStreamer:
                     continue
                 idle_since = time.monotonic()
                 last_heartbeat = idle_since
-                log.info(
+                log.debug(
                     "LLM got prompt seq=%d from prompt_in (qsize=%d)",
                     prompt.seq, self.prompt_in.qsize(),
                 )
@@ -88,7 +88,7 @@ class OllamaStreamer:
                     except asyncio.QueueEmpty:
                         break
                 if drained:
-                    log.info(
+                    log.debug(
                         "LLM drained %d stale prompts, running seq=%d",
                         drained, prompt.seq,
                     )
@@ -224,16 +224,16 @@ class OllamaStreamer:
         accumulated = ""
         first_token_logged = False
         t0 = time.monotonic()
-        log.info("LLM start seq=%d model=%s", prompt.seq, self.cfg.model)
+        log.debug("LLM start seq=%d model=%s", prompt.seq, self.cfg.model)
 
         def _dump(reason: str) -> None:
             clean = _strip_thinking(accumulated).strip()
-            log.info(
+            log.debug(
                 "LLM %s seq=%d in %.0fms (%d chars)",
                 reason, prompt.seq, (time.monotonic() - t0) * 1000, len(clean),
             )
             for ln in (clean or "<empty>").splitlines() or ["<empty>"]:
-                log.info("LLM[%d] | %s", prompt.seq, ln)
+                log.debug("LLM[%d] | %s", prompt.seq, ln)
 
         try:
             async with self._client.stream("POST", url, json=payload) as resp:
@@ -266,7 +266,7 @@ class OllamaStreamer:
                     done = bool(obj.get("done"))
                     if token:
                         if not first_token_logged:
-                            log.info(
+                            log.debug(
                                 "LLM first token seq=%d after %.0fms",
                                 prompt.seq, (time.monotonic() - t0) * 1000,
                             )
@@ -293,16 +293,14 @@ class OllamaStreamer:
                                 produced_at=time.monotonic(),
                             )
                         )
-                        # Full answer dumped over multiple log lines so it
-                        # stays readable in the console / log file.
-                        log.info(
+                        log.debug(
                             "LLM done seq=%d in %.0fms (%d chars)",
                             prompt.seq,
                             (time.monotonic() - t0) * 1000,
                             len(clean),
                         )
                         for ln in (clean or "<empty>").splitlines() or ["<empty>"]:
-                            log.info("LLM[%d] | %s", prompt.seq, ln)
+                            log.debug("LLM[%d] | %s", prompt.seq, ln)
                         if self.session_log is not None and clean:
                             self.session_log.log_answer(clean)
                         return
@@ -331,7 +329,7 @@ class OllamaStreamer:
         accumulated = ""
         first_token_logged = False
         t0 = time.monotonic()
-        log.info(
+        log.debug(
             "LLM start seq=%d source=bedrock model=%s region=%s",
             prompt.seq, settings.bedrock_model_id, settings.bedrock_region,
         )
@@ -358,7 +356,7 @@ class OllamaStreamer:
             if kind == "token":
                 token = str(payload)
                 if not first_token_logged:
-                    log.info(
+                    log.debug(
                         "LLM first token seq=%d after %.0fms",
                         prompt.seq, (time.monotonic() - t0) * 1000,
                     )
@@ -442,14 +440,14 @@ class OllamaStreamer:
                 produced_at=time.monotonic(),
             )
         )
-        log.info(
+        log.debug(
             "LLM done seq=%d in %.0fms (%d chars)",
             prompt.seq,
             (time.monotonic() - t0) * 1000,
             len(clean),
         )
         for ln in (clean or "<empty>").splitlines() or ["<empty>"]:
-            log.info("LLM[%d] | %s", prompt.seq, ln)
+            log.debug("LLM[%d] | %s", prompt.seq, ln)
         if self.session_log is not None and clean:
             self.session_log.log_answer(clean)
 

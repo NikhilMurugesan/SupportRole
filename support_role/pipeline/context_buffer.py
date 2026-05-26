@@ -111,7 +111,7 @@ class RollingContextManager:
             except asyncio.TimeoutError:
                 now = time.monotonic()
                 if now - last_heartbeat >= 5.0:
-                    log.info(
+                    log.debug(
                         "Context HEARTBEAT (idle %.1fs, transcript_qsize=%d, "
                         "prompt_qsize=%d/%d, latest_seq=%s, last_sent='%s')",
                         now - idle_since,
@@ -134,8 +134,8 @@ class RollingContextManager:
                     self.transcript_in.qsize(),
                 )
             else:
-                log.info(
-                    "*** Context got PAUSE transcript seq=%d state=%s (qsize=%d) ***",
+                log.debug(
+                    "Context got PAUSE transcript seq=%d state=%s (qsize=%d)",
                     update.seq, update.speech_state.value,
                     self.transcript_in.qsize(),
                 )
@@ -153,7 +153,7 @@ class RollingContextManager:
             if is_pause:
                 better = self._pick_best_utterance_text(text)
                 if better != text:
-                    log.info(
+                    log.debug(
                         "Context: replacing drifted final with best "
                         "utterance partial (%d->%d chars, %d q-marks)",
                         len(text), len(better), better.count("?"),
@@ -191,13 +191,16 @@ class RollingContextManager:
             if not fire:
                 continue
 
+            if is_pause and len(text.strip()) < 10:
+                log.debug("Context: skipping short PAUSE transcript (%d chars)", len(text.strip()))
+                self._utterance_partials.clear()
+                continue
+
             now = time.monotonic()
             if (now - last_emit_at) < cooldown_s:
                 continue
 
-            # Surface the trigger BEFORE the (potentially slow) RAG embed
-            # call so we can tell from logs whether the gate fired at all.
-            log.info(
+            log.debug(
                 "Trigger fired (is_pause=%s, ends_with_q=%s, seq=%d, %d chars)",
                 is_pause, ends_with_q, self._latest.seq, len(text),
             )
@@ -267,6 +270,9 @@ class RollingContextManager:
         if not text:
             return False
         rolling = text[-self.cfg.context_chars :]
+        if force and rolling == self._last_sent_text and len(rolling.strip()) < 30:
+            log.debug("Context: skipping duplicate forced emit (%d chars)", len(rolling))
+            return False
         if not force:
             if rolling == self._last_sent_text:
                 return False
@@ -308,7 +314,7 @@ class RollingContextManager:
                     knowledge_block = self.retriever.format_for_prompt(
                         chunks, CONFIG.knowledge.max_context_chars,
                     )
-                log.info(
+                log.debug(
                     "RAG retrieve OK in %.0f ms (%d chunks)",
                     (time.monotonic() - t0) * 1000, knowledge_hits,
                 )
@@ -322,7 +328,7 @@ class RollingContextManager:
                 log.exception("RAG retrieval failed (continuing without context)")
 
         preview = rolling if len(rolling) <= 80 else "..." + rolling[-77:]
-        log.info(
+        log.debug(
             "Context -> LLM (seq=%d, %d chars, +%d new, rag_hits=%d, force=%s): '%s'",
             self._latest.seq, len(rolling), new_chars,
             knowledge_hits, force, preview,
@@ -340,7 +346,7 @@ class RollingContextManager:
             )
         )
         dropped = getattr(self.prompt_out, "last_drop_count", 0)
-        log.info(
+        log.debug(
             "Context put prompt seq=%d -> prompt_out (qsize=%d/%d, dropped=%d)",
             self._latest.seq,
             self.prompt_out.qsize(), self.prompt_out.maxsize(), dropped,
