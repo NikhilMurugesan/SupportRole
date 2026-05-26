@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 
 # ----- Python bytecode / caches --------------------------------------------
-__pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -133,10 +133,3 @@ scratch/
 *.tmp
 *.bak
 *.old
-support_role/__pycache__/config.cpython-313.pyc
-support_role/__pycache__/main.cpython-313.pyc
-support_role/pipeline/__pycache__/context_buffer.cpython-313.pyc
-support_role/pipeline/__pycache__/llm_streamer.cpython-313.pyc
-support_role/pipeline/__pycache__/udp_receiver.cpython-313.pyc
-support_role/pipeline/__pycache__/vad.cpython-313.pyc
-support_role/ui/__pycache__/main_window.cpython-313.pyc
