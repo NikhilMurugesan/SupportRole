@@ -66,7 +66,7 @@ class OllamaStreamer:
                 except asyncio.TimeoutError:
                     now = time.monotonic()
                     if now - last_heartbeat >= 5.0:
-                        log.info(
+                        log.debug(
                             "LLM HEARTBEAT (idle %.1fs, prompt_qsize=%d, waiting for prompt)",
                             now - idle_since, self.prompt_in.qsize(),
                         )
@@ -74,7 +74,7 @@ class OllamaStreamer:
                     continue
                 idle_since = time.monotonic()
                 last_heartbeat = idle_since
-                log.info(
+                log.debug(
                     "LLM got prompt seq=%d from prompt_in (qsize=%d)",
                     prompt.seq, self.prompt_in.qsize(),
                 )
@@ -88,7 +88,7 @@ class OllamaStreamer:
                     except asyncio.QueueEmpty:
                         break
                 if drained:
-                    log.info(
+                    log.debug(
                         "LLM drained %d stale prompts, running seq=%d",
                         drained, prompt.seq,
                     )
@@ -224,16 +224,16 @@ class OllamaStreamer:
         accumulated = ""
         first_token_logged = False
         t0 = time.monotonic()
-        log.info("LLM start seq=%d model=%s", prompt.seq, self.cfg.model)
+        log.debug("LLM start seq=%d model=%s", prompt.seq, self.cfg.model)
 
         def _dump(reason: str) -> None:
-            clean = _strip_thinking(accumulated).strip()
-            log.info(
+            clean = _visible_answer(accumulated, prompt.rolling_text)
+            log.debug(
                 "LLM %s seq=%d in %.0fms (%d chars)",
                 reason, prompt.seq, (time.monotonic() - t0) * 1000, len(clean),
             )
             for ln in (clean or "<empty>").splitlines() or ["<empty>"]:
-                log.info("LLM[%d] | %s", prompt.seq, ln)
+                log.debug("LLM[%d] | %s", prompt.seq, ln)
 
         try:
             async with self._client.stream("POST", url, json=payload) as resp:
@@ -266,13 +266,13 @@ class OllamaStreamer:
                     done = bool(obj.get("done"))
                     if token:
                         if not first_token_logged:
-                            log.info(
+                            log.debug(
                                 "LLM first token seq=%d after %.0fms",
                                 prompt.seq, (time.monotonic() - t0) * 1000,
                             )
                             first_token_logged = True
                         accumulated += token
-                        clean = _strip_thinking(accumulated).strip()
+                        clean = _visible_answer(accumulated, prompt.rolling_text)
                         self.hint_out.put_latest(
                             HintToken(
                                 text=token,
@@ -283,7 +283,7 @@ class OllamaStreamer:
                             )
                         )
                     if done:
-                        clean = _strip_thinking(accumulated).strip()
+                        clean = _visible_answer(accumulated, prompt.rolling_text)
                         self.hint_out.put_latest(
                             HintToken(
                                 text="",
@@ -293,16 +293,14 @@ class OllamaStreamer:
                                 produced_at=time.monotonic(),
                             )
                         )
-                        # Full answer dumped over multiple log lines so it
-                        # stays readable in the console / log file.
-                        log.info(
+                        log.debug(
                             "LLM done seq=%d in %.0fms (%d chars)",
                             prompt.seq,
                             (time.monotonic() - t0) * 1000,
                             len(clean),
                         )
                         for ln in (clean or "<empty>").splitlines() or ["<empty>"]:
-                            log.info("LLM[%d] | %s", prompt.seq, ln)
+                            log.debug("LLM[%d] | %s", prompt.seq, ln)
                         if self.session_log is not None and clean:
                             self.session_log.log_answer(clean)
                         return
@@ -331,7 +329,7 @@ class OllamaStreamer:
         accumulated = ""
         first_token_logged = False
         t0 = time.monotonic()
-        log.info(
+        log.debug(
             "LLM start seq=%d source=bedrock model=%s region=%s",
             prompt.seq, settings.bedrock_model_id, settings.bedrock_region,
         )
@@ -358,13 +356,13 @@ class OllamaStreamer:
             if kind == "token":
                 token = str(payload)
                 if not first_token_logged:
-                    log.info(
+                    log.debug(
                         "LLM first token seq=%d after %.0fms",
                         prompt.seq, (time.monotonic() - t0) * 1000,
                     )
                     first_token_logged = True
                 accumulated += token
-                clean = _strip_thinking(accumulated).strip()
+                clean = _visible_answer(accumulated, prompt.rolling_text)
                 self.hint_out.put_latest(
                     HintToken(
                         text=token,
@@ -375,7 +373,7 @@ class OllamaStreamer:
                     )
                 )
             elif kind == "done":
-                clean = _strip_thinking(accumulated).strip()
+                clean = _visible_answer(accumulated, prompt.rolling_text)
                 self._emit_done(prompt, clean, t0)
                 return
             elif kind == "error":
@@ -442,14 +440,14 @@ class OllamaStreamer:
                 produced_at=time.monotonic(),
             )
         )
-        log.info(
+        log.debug(
             "LLM done seq=%d in %.0fms (%d chars)",
             prompt.seq,
             (time.monotonic() - t0) * 1000,
             len(clean),
         )
         for ln in (clean or "<empty>").splitlines() or ["<empty>"]:
-            log.info("LLM[%d] | %s", prompt.seq, ln)
+            log.debug("LLM[%d] | %s", prompt.seq, ln)
         if self.session_log is not None and clean:
             self.session_log.log_answer(clean)
 
@@ -515,6 +513,59 @@ def _build_user_prompt(
         "source documents, filenames, PDFs, or snippet numbers."
     )
     return "\n\n".join(parts)
+
+
+def _extract_answer_target(text: str) -> str:
+    """Return the latest likely question/request from a noisy rolling window."""
+    t = " ".join(text.strip().split())
+    if not t:
+        return ""
+
+    question_end = t.rfind("?")
+    if question_end != -1:
+        prefix = t[: question_end + 1]
+        start = 0
+        for sep in (". ", "! ", "? ", "; "):
+            idx = prefix.rfind(sep, 0, max(0, question_end - 1))
+            if idx != -1:
+                start = max(start, idx + len(sep))
+        return prefix[start:].strip()
+
+    # No explicit question mark: use the final sentence/fragment after the
+    # most recent boundary. Pause-driven mode should still answer it.
+    start = 0
+    for sep in (". ", "! ", "? ", "; "):
+        idx = t.rfind(sep)
+        if idx != -1:
+            start = max(start, idx + len(sep))
+    return t[start:].strip()
+
+
+def _visible_answer(text: str, rolling_text: str) -> str:
+    clean = _strip_thinking(text).strip()
+    return _strip_leading_transcript_echo(clean, rolling_text).strip()
+
+
+def _strip_leading_transcript_echo(answer: str, rolling_text: str) -> str:
+    """Drop a copied transcript/target line before the real answer."""
+    if not answer:
+        return ""
+    compact_source = " ".join(rolling_text.strip().split())
+    candidates = [
+        _extract_answer_target(rolling_text),
+        compact_source,
+    ]
+    folded_answer = answer.casefold()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if len(candidate) < 12:
+            continue
+        folded_candidate = candidate.casefold()
+        if folded_candidate.startswith(folded_answer):
+            return ""
+        if folded_answer.startswith(folded_candidate):
+            return answer[len(candidate):].lstrip(" \t\r\n:-")
+    return answer
 
 
 _THINK_OPEN = "<think>"

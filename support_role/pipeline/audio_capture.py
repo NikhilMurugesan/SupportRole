@@ -67,13 +67,13 @@ class LoopbackCapture:
     def _run(self) -> None:
         chunk_frames = int(self.cfg.sample_rate * self.cfg.capture_chunk_ms / 1000)
         try:
-            mic = self._open_device()
+            device = self._open_device()
         except Exception:
             log.exception("Failed to open audio device")
             return
 
         try:
-            with mic.recorder(
+            with device.recorder(
                 samplerate=self.cfg.sample_rate,
                 channels=self.cfg.channels,
                 blocksize=chunk_frames,
@@ -98,7 +98,6 @@ class LoopbackCapture:
 
         * mode="loopback" -> default (or named) speaker exposed as a recordable
           source via WASAPI loopback. Audio still plays normally.
-        * mode="mic"      -> default (or named) microphone.
         """
         mode = self.cfg.input_mode
         name_filter = (self.cfg.device_name or "").lower().strip()
@@ -111,17 +110,5 @@ class LoopbackCapture:
                 speaker = sc.default_speaker()
             log.info("Capture mode=loopback source=%s", speaker.name)
             return sc.get_microphone(id=str(speaker.name), include_loopback=True)
-
-        if mode == "mic":
-            if name_filter:
-                mics = [
-                    m for m in sc.all_microphones(include_loopback=False)
-                    if name_filter in m.name.lower()
-                ]
-                mic = mics[0] if mics else sc.default_microphone()
-            else:
-                mic = sc.default_microphone()
-            log.info("Capture mode=mic source=%s", mic.name)
-            return mic
 
         raise ValueError(f"Unknown input_mode: {mode!r}")

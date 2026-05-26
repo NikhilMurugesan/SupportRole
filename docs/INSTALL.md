@@ -43,14 +43,13 @@ See [OLLAMA_SETUP.md](OLLAMA_SETUP.md). The default model is `phi3:mini`.
 Edit `AudioConfig` in [../support_role/config.py](../support_role/config.py):
 
 ```python
-input_mode: Literal["loopback", "mic", "udp"] = "udp"  # default
+input_mode: Literal["loopback", "udp"] = "udp"         # default
 device_name: Optional[str] = None                       # substring match, or None
 ```
 
 | Mode       | What it captures                                          |
 | ---------- | --------------------------------------------------------- |
 | `loopback` | Whatever your PC is **playing** through its default speaker (WASAPI loopback). Audio still plays normally. |
-| `mic`      | Your **microphone** (default or matched by `device_name`). |
 | `udp`      | int16 PCM packets received on `UdpConfig.listen_ip:listen_port` (default `0.0.0.0:50007`). Matches the simple `socket.sendto` sender script. |
 
 List devices so you can copy a name fragment into `device_name`:
@@ -104,7 +103,6 @@ You should see one of:
 
 ```
 Capture mode=loopback source=Speakers (Realtek…)
-Capture mode=mic source=Microphone (Realtek…)
 UDP audio receiver listening on 0.0.0.0:50007 (src=48000Hz/2ch -> 16000Hz mono)
 ```
 

@@ -15,11 +15,10 @@ from typing import Literal, Optional
 class AudioConfig:
     # Where to record from:
     #   "loopback" -> captures system speaker output (Zoom, YouTube, etc.)
-    #   "mic"      -> captures your default microphone
     #   "udp"      -> receives int16 PCM packets over UDP (see UdpConfig)
-    input_mode: Literal["loopback", "mic", "udp"] = "udp"
+    input_mode: Literal["loopback", "udp"] = "udp"
     # Optional: pick a specific device by (sub-)name. None = system default.
-    # Examples: "Headset Microphone", "Speakers (Realtek", "BlackHole".
+    # Examples: "Speakers (Realtek", "BlackHole".
     device_name: Optional[str] = None
 
     # WebRTC VAD only supports 8/16/32/48 kHz mono int16. We resample to 16 kHz.
@@ -31,14 +30,14 @@ class AudioConfig:
     # VAD frame size (must be 10/20/30 ms for webrtcvad).
     vad_frame_ms: int = 20
     # 0 (least aggressive) ... 3 (most aggressive at filtering non-speech).
-    vad_aggressiveness: int = 2
+    vad_aggressiveness: int = 3
     # How many silent VAD frames before we declare a "pause".
     # How many silent VAD frames before we declare a "pause".
     # 50 frames * 20 ms = ~1000 ms — matches the "any pause >1 s should
     # trigger an answer" requirement.
     silence_frames_for_pause: int = 50
     # How many speech frames before we declare speech "started".
-    speech_frames_to_start: int = 2  # ~40 ms
+    speech_frames_to_start: int = 8  # ~160 ms
     # Max rolling audio kept for transcription, in seconds.
     # 25 s is enough to cover a long multi-question stream like
     # "what is your RAG architecture? how did you design it? why a vector
@@ -140,11 +139,14 @@ class LLMConfig:
         "utterance directly and helpfully, in SIMPLE spoken English that "
         "a non-expert can follow. "
         "If a Current interview context is provided in the user prompt, "
-        "treat it as higher priority than retrieved snippets and keep the "
-        "answer in that domain. Do not invent unrelated Q&A from noisy "
-        "transcript fragments. If the latest speech is only filler or "
-        "acknowledgement and no concrete question is present, output exactly "
-        "'- Waiting for the actual question.' "
+        "use it as domain background, but the live paused transcript is the "
+        "current request and has priority. When a silence pause triggers a "
+        "prompt, answer immediately with the best useful response; do not wait "
+        "for a question mark or return a waiting placeholder. If the latest "
+        "speech is a statement or fragment, infer the likely interview prompt "
+        "and explain the relevant concept. If it is only filler or an "
+        "acknowledgement, give one short useful acknowledgement instead of "
+        "waiting. "
         "BUT the answer MUST also include the important technical keywords, "
         "terms, and concept names related to the topic (e.g. specific "
         "tools, APIs, algorithms, design patterns, library names). "

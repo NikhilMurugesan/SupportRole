@@ -29,11 +29,12 @@ Behavior:
 from __future__ import annotations
 
 import html
+import logging
 import re
 import time
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -58,6 +59,8 @@ from ..llm_settings import (
     ONLINE_SOURCE,
     llm_settings,
 )
+
+log = logging.getLogger(__name__)
 
 
 _STYLE = """
@@ -99,6 +102,12 @@ QComboBox {
     border-radius: 6px; padding: 4px 10px; min-width: 116px;
 }
 QComboBox:disabled { color: #6f7a8c; background: #1b1e26; }
+QLineEdit#textInput {
+    background: #1c1f26; color: #e6e9ef;
+    border: 1px solid #2e3340; border-radius: 6px;
+    padding: 6px 10px; font-size: 14px;
+}
+QLineEdit#textInput:focus { border: 1px solid #3a4b66; }
 QStatusBar { color: #8a93a3; }
 """
 
@@ -180,8 +189,7 @@ class _AnswerCard(QFrame):
 class MainWindow(QMainWindow):
     transcript_signal = pyqtSignal(str, bool)     # (text, is_partial)
     hint_signal = pyqtSignal(str, bool, int)      # (full_text, done, seq)
-    mic_request_signal = pyqtSignal(bool)         # requested active state
-    mic_status_signal = pyqtSignal(bool, str)     # actual active state, status
+    text_input_signal = pyqtSignal(str)           # user-typed question text
 
     def __init__(self) -> None:
         super().__init__()
@@ -195,13 +203,6 @@ class MainWindow(QMainWindow):
         self._active_started_at = 0.0
         self._last_transcript_at = 0.0
         self._syncing_controls = False
-        self._syncing_mic = False
-        self._mic_ready = False
-        self._mic_active = False
-        self._pending_mic_request: Optional[bool] = None
-        self._mic_request_timer = QTimer(self)
-        self._mic_request_timer.setSingleShot(True)
-        self._mic_request_timer.timeout.connect(self._on_mic_request_timeout)
 
         self._build_ui()
         self._wire_signals()
@@ -248,15 +249,22 @@ class MainWindow(QMainWindow):
         self.scroll.setWidget(self.card_host)
         root.addWidget(self.scroll, 1)
 
+        # ---- text input row
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+        self.text_input = QLineEdit(self)
+        self.text_input.setObjectName("textInput")
+        self.text_input.setPlaceholderText("Type a question and press Enter...")
+        self.send_btn = QPushButton("Send", self)
+        self.text_input.returnPressed.connect(self._on_text_submit)
+        self.send_btn.clicked.connect(self._on_text_submit)
+        input_row.addWidget(self.text_input, 1)
+        input_row.addWidget(self.send_btn)
+        root.addLayout(input_row)
+
         # ---- action bar
         actions = QHBoxLayout()
         actions.setSpacing(8)
-        self.mic_btn = QPushButton("Mic: OFF", self)
-        self.mic_btn.setCheckable(True)
-        self.mic_btn.setEnabled(False)
-        self.mic_btn.setText("Mic: WAITING")
-        actions.addWidget(self.mic_btn)
-
         actions.addWidget(self._control_label("LLM"))
         self.llm_source_combo = QComboBox(self)
         self.llm_source_combo.addItem("Local", LOCAL_SOURCE)
@@ -290,8 +298,6 @@ class MainWindow(QMainWindow):
     def _wire_signals(self) -> None:
         self.transcript_signal.connect(self._on_transcript)
         self.hint_signal.connect(self._on_hint)
-        self.mic_status_signal.connect(self._on_mic_status)
-        self.mic_btn.toggled.connect(self._on_mic_toggled)
         self.llm_source_combo.currentIndexChanged.connect(
             self._on_llm_source_changed
         )
@@ -338,40 +344,15 @@ class MainWindow(QMainWindow):
         self._active_seq = None
         self._update_status(f"Answer ready  ({latency_ms} ms)")
 
-    def _on_mic_toggled(self, active: bool) -> None:
-        if self._syncing_mic:
+    def _on_text_submit(self) -> None:
+        text = self.text_input.text().strip()
+        if not text:
             return
-        if not self._mic_ready:
-            self._sync_mic_button(self._mic_active)
-            self._update_status("Mic controls are still starting")
-            return
-        self.mic_btn.setEnabled(False)
-        self.mic_btn.setText("Mic: STARTING" if active else "Mic: STOPPING")
-        self._pending_mic_request = active
-        self._mic_request_timer.start(10_000)
-        self.mic_request_signal.emit(active)
-
-    def _on_mic_status(self, active: bool, message: str) -> None:
-        self._mic_ready = True
-        self._pending_mic_request = None
-        self._mic_request_timer.stop()
-        self._sync_mic_button(active)
-        self._update_status(message)
-
-    def _on_mic_request_timeout(self) -> None:
-        self._pending_mic_request = None
-        self._sync_mic_button(self._mic_active)
-        self._update_status("Mic request timed out; check console logs")
-
-    def _sync_mic_button(self, active: bool) -> None:
-        self._syncing_mic = True
-        try:
-            self._mic_active = active
-            self.mic_btn.setChecked(active)
-            self.mic_btn.setText("Mic: ON" if active else "Mic: OFF")
-            self.mic_btn.setEnabled(self._mic_ready)
-        finally:
-            self._syncing_mic = False
+        log.info("UI text submit (%d chars)", len(text))
+        self.text_input.clear()
+        self.live_transcript.setText(text)
+        self.text_input_signal.emit(text)
+        self._update_status("Sent typed question")
 
     def _on_llm_source_changed(self, _index: int) -> None:
         if self._syncing_controls:
@@ -470,12 +451,10 @@ class MainWindow(QMainWindow):
     def _update_status(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
         snap = llm_settings.snapshot()
-        mic = "on" if self._mic_active else "off"
         self.status.showMessage(
             f"{msg}   ·   {ts}   ·   {CONFIG.llm.model}   ·   "
             f"input: {CONFIG.audio.input_mode}   -   "
-            f"{snap.active_source_label}: {snap.active_model_label}   -   "
-            f"mic: {mic}",
+            f"{snap.active_source_label}: {snap.active_model_label}",
             4000,
         )
 

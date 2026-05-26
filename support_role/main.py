@@ -23,10 +23,10 @@ import logging
 import signal
 import sys
 import threading
-from dataclasses import dataclass, replace
+import time
+from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
 from PyQt6.QtWidgets import QApplication
 
 from .config import CONFIG
@@ -79,84 +79,13 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
 
     if CONFIG.audio.input_mode == "udp":
         capture = UdpAudioReceiver(audio_q)
-    else:
+    elif CONFIG.audio.input_mode == "loopback":
         # Lazy import: `soundcard` initializes COM, which conflicts with Qt
         # on the main thread when we don't actually need it.
         from .pipeline.audio_capture import LoopbackCapture
         capture = LoopbackCapture(audio_q)
-
-    mic_capture = None
-    mic_active = CONFIG.audio.input_mode == "mic"
-
-    def _emit_mic_status(active: bool, message: str) -> None:
-        if ui.main is not None:
-            ui.main.mic_status_signal.emit(active, message)
-
-    def _flush_mic_silence() -> None:
-        chunk_samples = int(
-            CONFIG.audio.sample_rate * CONFIG.audio.capture_chunk_ms / 1000
-        )
-        pause_ms = (
-            CONFIG.audio.silence_frames_for_pause * CONFIG.audio.vad_frame_ms
-            + CONFIG.audio.capture_chunk_ms
-        )
-        chunks = max(
-            1,
-            int((pause_ms + CONFIG.audio.capture_chunk_ms - 1)
-                / CONFIG.audio.capture_chunk_ms),
-        )
-        silence = np.zeros(chunk_samples, dtype=np.float32)
-        for _ in range(chunks):
-            audio_q.put_latest(silence.copy())
-
-    def _set_mic_active(active: bool) -> None:
-        nonlocal mic_capture, mic_active
-        log.info("Mic toggle requested: active=%s current=%s", active, mic_active)
-        if CONFIG.audio.input_mode == "mic":
-            mic_active = True
-            _emit_mic_status(True, "Mic is already the configured input")
-            return
-        if active == mic_active:
-            _emit_mic_status(
-                mic_active, "Mic already active" if mic_active else "Mic already off"
-            )
-            return
-        try:
-            if active:
-                from .pipeline.audio_capture import LoopbackCapture
-                log.info("Switching audio capture to microphone")
-                capture.stop()
-                mic_cfg = replace(
-                    CONFIG.audio, input_mode="mic", device_name=None
-                )
-                if mic_capture is None:
-                    mic_capture = LoopbackCapture(audio_q, cfg=mic_cfg)
-                mic_capture.start()
-                mic_active = True
-                _emit_mic_status(True, "Mic active")
-                return
-
-            if mic_capture is not None:
-                log.info("Stopping microphone capture")
-                mic_capture.stop()
-            _flush_mic_silence()
-            log.info("Restoring configured audio capture: %s", CONFIG.audio.input_mode)
-            capture.start()
-            mic_active = False
-            _emit_mic_status(False, "Mic stopped; processing speech")
-        except Exception as exc:
-            log.exception("Mic toggle failed")
-            mic_active = False
-            try:
-                capture.start()
-            except Exception:
-                log.exception("Failed to restart configured capture")
-            _emit_mic_status(False, f"Mic failed: {exc}")
-
-    if ui.main is not None:
-        ui.main.mic_request_signal.connect(
-            lambda active: loop.call_soon_threadsafe(_set_mic_active, active)
-        )
+    else:
+        raise ValueError(f"Unknown input_mode: {CONFIG.audio.input_mode!r}")
 
     vad = StreamingVAD(audio_q, window_q)
     session_log = SessionLog.for_run()
@@ -194,8 +123,25 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
     )
     llm = OllamaStreamer(prompt_q, hint_q, cancel_event, session_log=session_log)
 
-    if not mic_active:
-        capture.start()
+    # ---- text input from UI -> direct LLM prompt injection ----
+    _text_seq = [-1000]
+
+    def _on_text_input(text: str) -> None:
+        _text_seq[0] -= 1
+        seq = _text_seq[0]
+        log.info("Text input -> LLM prompt seq=%d (%d chars)", seq, len(text))
+        if session_log is not None:
+            session_log.log_transcript(text)
+        prompt_q.put_latest(ContextPrompt(
+            rolling_text=text, seq=seq, produced_at=time.monotonic(),
+        ))
+
+    if ui.main is not None:
+        ui.main.text_input_signal.connect(
+            lambda text: loop.call_soon_threadsafe(_on_text_input, text)
+        )
+
+    capture.start()
     try:
         tasks = [
             asyncio.create_task(vad.run(stop), name="vad"),
@@ -206,10 +152,6 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
         ]
         if indexer is not None:
             tasks.append(asyncio.create_task(indexer.run(stop), name="indexer"))
-        _emit_mic_status(
-            mic_active,
-            "Mic active" if mic_active else "Mic off",
-        )
         done, pending = await asyncio.wait(
             tasks, return_when=asyncio.FIRST_EXCEPTION
         )
@@ -220,8 +162,6 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
                 log.error("Task %s crashed: %r", t.get_name(), exc)
     finally:
         capture.stop()
-        if mic_capture is not None:
-            mic_capture.stop()
         transcriber.shutdown()
 
 
@@ -232,7 +172,6 @@ async def _ui_pump(
     stop: asyncio.Event,
 ) -> None:
     """Fan transcript + hint updates out to Qt signals on every active window."""
-    import time
 
     async def pump_transcript():
         last_warn = time.monotonic()
@@ -268,7 +207,7 @@ async def _ui_pump(
             # confirm hints are reaching the UI.
             if tok.done or first_seq != tok.seq:
                 first_seq = tok.seq
-                log.info(
+                log.debug(
                     "UI <- hint seq=%d done=%s (%d chars): %r",
                     tok.seq, tok.done, len(tok.full),
                     (tok.full[:80] + "…") if len(tok.full) > 80 else tok.full,
@@ -307,7 +246,7 @@ def _create_ui() -> tuple[QApplication, UIHandles]:
 
 def run(debug: bool = False) -> int:
     logging.basicConfig(
-        level=logging.DEBUG if debug else logging.INFO,
+        level=logging.DEBUG if debug else logging.WARNING,
         format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
         stream=sys.stderr,

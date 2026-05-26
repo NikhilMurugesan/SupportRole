@@ -154,8 +154,8 @@ class StreamingVAD:
         # SPEAKING windows fire ~5x/s and flood the log; keep them at DEBUG.
         # PAUSED windows are rare and trigger downstream answers — LOG LOUD.
         if self._state == SpeechState.PAUSED:
-            log.info(
-                "*** VAD emit PAUSE seq=%d samples=%d -> window_out (qsize=%d/%d, dropped=%d) ***",
+            log.debug(
+                "VAD emit PAUSE seq=%d samples=%d -> window_out (qsize=%d/%d, dropped=%d)",
                 self._seq, audio.size,
                 self.window_out.qsize(), self.window_out.maxsize(), dropped,
             )

@@ -27,8 +27,8 @@ Target hardware: **RTX 4080 SUPER + Ryzen 9 7950X3D + 64 GB RAM, Windows 11**.
 ```
  ┌──────────────────┐    ┌──────┐    ┌──────────────────┐    ┌──────────────┐    ┌──────────┐
  │ Audio source     │──► │ VAD  │──► │ Faster-Whisper   │──► │ Rolling Ctx  │──► │ Ollama   │
- │  loopback / mic /│    │ WebRTC│   │ small.en / FP16  │    │ debouncer    │    │ stream   │
- │  UDP receiver    │    └──────┘    └──────────────────┘    └──────────────┘    └────┬─────┘
+ │  loopback / UDP  │    │ WebRTC│   │ small.en / FP16  │    │ debouncer    │    │ stream   │
+ │  receiver        │    └──────┘    └──────────────────┘    └──────────────┘    └────┬─────┘
  └──────────────────┘                                                                  │
                                                                                        ▼
                                                                               ┌──────────────┐
@@ -47,7 +47,6 @@ Pick one in `AudioConfig.input_mode` ([support_role/config.py](support_role/conf
 | Mode       | Source                                                    | When to use                                            |
 | ---------- | --------------------------------------------------------- | ------------------------------------------------------ |
 | `loopback` | Default speaker captured via WASAPI loopback              | Transcribe whatever your PC is **playing** (Zoom, YouTube, Discord). Audio still plays normally. |
-| `mic`      | Default microphone                                        | Transcribe **yourself** speaking.                       |
 | `udp`      | int16 PCM stream over UDP (default `0.0.0.0:50007`)       | Receive audio **from another PC / device** over the network. Matches the simple `socket.sendto` sender script. |
 
 List available devices:
@@ -85,7 +84,7 @@ SupportRole/
     ├── main.py                   # async orchestrator + tray
     ├── pipeline/
     │   ├── __init__.py
-    │   ├── audio_capture.py      # WASAPI loopback / mic (soundcard)
+    │   ├── audio_capture.py      # WASAPI loopback (soundcard)
     │   ├── udp_receiver.py       # UDP int16 PCM receiver
     │   ├── vad.py                # WebRTC VAD streaming gate
     │   ├── transcriber.py        # Faster-Whisper streaming
@@ -93,7 +92,7 @@ SupportRole/
     │   ├── llm_streamer.py       # Ollama streaming client
     │   └── util_queue.py         # latest-wins async queue
     ├── tools/
-    │   └── list_devices.py       # CLI: enumerate speakers / mics
+    │   └── list_devices.py       # CLI: enumerate speakers
     └── ui/
         ├── __init__.py
         ├── overlay.py            # PyQt6 transparent always-on-top overlay
