@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import QApplication
 
 from .config import CONFIG
 from .llm_settings import llm_settings
-from .pipeline.context_buffer import ContextPrompt, RollingContextManager
+from .pipeline.conversation_orchestrator import ContextPrompt, ConversationOrchestrator
 from .pipeline.llm_streamer import HintToken, OllamaStreamer
 from .pipeline.session_log import SessionLog
 from .pipeline.transcriber import StreamingTranscriber, TranscriptUpdate
@@ -118,23 +118,27 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
             indexer = None
             retriever = None
 
-    context = RollingContextManager(
-        transcript_q, prompt_q, cancel_event, retriever=retriever,
+    orchestrator = ConversationOrchestrator(
+        transcript_in=transcript_q,
+        prompt_out=prompt_q,
+        cancel_event=cancel_event,
+        retriever=retriever,
     )
-    llm = OllamaStreamer(prompt_q, hint_q, cancel_event, session_log=session_log)
+    llm = OllamaStreamer(
+        prompt_in=prompt_q,
+        hint_out=hint_q,
+        cancel_event=cancel_event,
+        session_log=session_log,
+        orchestrator=orchestrator,
+    )
+    orchestrator.streamer = llm
 
     # ---- text input from UI -> direct LLM prompt injection ----
-    _text_seq = [-1000]
-
     def _on_text_input(text: str) -> None:
-        _text_seq[0] -= 1
-        seq = _text_seq[0]
-        log.info("Text input -> LLM prompt seq=%d (%d chars)", seq, len(text))
         if session_log is not None:
             session_log.log_transcript(text)
-        prompt_q.put_latest(ContextPrompt(
-            rolling_text=text, seq=seq, produced_at=time.monotonic(),
-        ))
+        # Handle typed text asynchronously via the orchestrator
+        asyncio.create_task(orchestrator.handle_typed_text(text))
 
     if ui.main is not None:
         ui.main.text_input_signal.connect(
@@ -146,7 +150,7 @@ async def _pipeline_main(ui: UIHandles, stop: asyncio.Event) -> None:
         tasks = [
             asyncio.create_task(vad.run(stop), name="vad"),
             asyncio.create_task(transcriber.run(stop), name="transcriber"),
-            asyncio.create_task(context.run(stop), name="context"),
+            asyncio.create_task(orchestrator.run(stop), name="orchestrator"),
             asyncio.create_task(llm.run(stop), name="llm"),
             asyncio.create_task(_ui_pump(transcript_ui_q, hint_q, ui, stop), name="ui"),
         ]

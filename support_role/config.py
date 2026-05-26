@@ -32,10 +32,11 @@ class AudioConfig:
     # 0 (least aggressive) ... 3 (most aggressive at filtering non-speech).
     vad_aggressiveness: int = 3
     # How many silent VAD frames before we declare a "pause".
-    # How many silent VAD frames before we declare a "pause".
-    # 50 frames * 20 ms = ~1000 ms — matches the "any pause >1 s should
-    # trigger an answer" requirement.
-    silence_frames_for_pause: int = 50
+    # 25 frames * 20 ms = ~500 ms — the adaptive pause detector in the
+    # ConversationOrchestrator applies real thresholds on top.  This low
+    # value ensures the orchestrator sees pauses early and can decide
+    # whether they are meaningful.
+    silence_frames_for_pause: int = 25
     # How many speech frames before we declare speech "started".
     speech_frames_to_start: int = 8  # ~160 ms
     # Max rolling audio kept for transcription, in seconds.
@@ -110,49 +111,31 @@ class LLMConfig:
     num_ctx: int = 8192
     temperature: float = 0.2
     top_p: float = 0.9
-    # Cooldown (ms) between two consecutive LLM emissions. In Q&A mode this
-    # is the minimum spacing between answering two back-to-back questions,
-    # so the previous answer stays readable.
+    # Cooldown (ms) between two consecutive LLM emissions.
     debounce_ms: int = 800
     # Minimum new chars in rolling buffer before we bother re-prompting.
     min_new_chars: int = 4
     # Rolling context window passed to the LLM (chars from end of transcript).
-    # Sized to cover the full ~25 s VAD window so multi-question utterances
-    # like "what is X? how does Y work? and explain Z" are sent intact —
-    # otherwise only the trailing fragment reaches the LLM and earlier
-    # questions in the same breath are silently dropped.
     context_chars: int = 3500
-    # Trigger policy: ONLY fire on VAD pauses (~1 s of silence). Mid-partial
-    # '?' triggers used to cause the LLM to answer garbled half-questions
-    # like "The kind?" and burn 4-5 s of LLM time on noise, starving the
-    # real questions that came right after. Set fire_on_partial_question=True
-    # to restore the old behavior.
+    # --- Legacy flags (kept for backwards compat, ignored by orchestrator) ---
     fire_on_partial_question: bool = False
     question_mode: bool = False
-    # In Q&A mode we keep cancellation OFF so the user can actually read the
-    # answer before it gets replaced by the next one.
     cancel_on_new_input: bool = False
     request_timeout_s: float = 60.0
 
     system_prompt: str = (
-        "You are a realtime assistant. Answer the user's most recent "
-        "utterance directly and helpfully, in SIMPLE spoken English that "
-        "a non-expert can follow. "
-        "If a Current interview context is provided in the user prompt, "
-        "use it as domain background, but the live paused transcript is the "
-        "current request and has priority. When a silence pause triggers a "
-        "prompt, answer immediately with the best useful response; do not wait "
-        "for a question mark or return a waiting placeholder. If the latest "
-        "speech is a statement or fragment, infer the likely interview prompt "
-        "and explain the relevant concept. If it is only filler or an "
-        "acknowledgement, give one short useful acknowledgement instead of "
-        "waiting. "
-        "BUT the answer MUST also include the important technical keywords, "
-        "terms, and concept names related to the topic (e.g. specific "
-        "tools, APIs, algorithms, design patterns, library names). "
+        "You are a realtime conversational assistant that listens continuously "
+        "and responds naturally. Adapt your response style to the conversation:\n"
+        "- For QUESTIONS: give a direct, helpful answer with key details.\n"
+        "- For STATEMENTS: acknowledge and add relevant insight or explanation.\n"
+        "- For FOLLOW-UPS: build on your previous response with additional detail.\n"
+        "- For CORRECTIONS: acknowledge the correction and adjust your understanding.\n"
+        "- For TOPIC CHANGES: smoothly transition to the new topic.\n\n"
+        "Use SIMPLE spoken English that a non-expert can follow. "
+        "Include important technical keywords, terms, and concept names. "
         "WRAP every important keyword in double asterisks like **this** so "
         "the UI can highlight it. Wrap at least 3 keywords per answer. "
-        "Cover the small underlying concepts too, briefly. "
+        "Cover the small underlying concepts too, briefly.\n\n"
         "IF THE UTTERANCE CONTAINS MULTIPLE QUESTIONS OR REQUESTS "
         "(joined by 'and', 'also', commas, or separate sentences), "
         "YOU MUST ANSWER EVERY ONE OF THEM. Group bullets per question "
@@ -160,18 +143,22 @@ class LLMConfig:
         "'Q1: <short restatement>' on its own line, then 2-4 '- ' bullets "
         "under it, then 'Q2: <...>' and its bullets, and so on. "
         "For a single question, skip the 'Q1:' header and just emit "
-        "3-6 '- ' bullets. "
-        "Total length ~40-110 words depending on how many questions. "
+        "3-6 '- ' bullets.\n\n"
+        "Total length ~40-120 words depending on complexity. "
         "First bullet of each group is the direct answer in plain words; "
         "remaining bullets each highlight 1-2 **keywords** in plain "
         "explanation. "
         "No markdown other than '- ', '**keyword**', and the 'Qn:' "
         "headers. No preface. No reasoning aloud. Do not repeat the "
-        "question verbatim. "
+        "question verbatim.\n\n"
+        "If a conversation history is provided, use it for context and "
+        "continuity but focus on the LATEST utterance. "
+        "If interview context is provided, use it as domain background "
+        "but the live speech has priority. "
         "NEVER mention or cite source documents, file names, PDFs, "
         "snippet numbers, or phrases like 'according to', 'based on "
         "the document', '(1)', '[2]'. Speak as if the knowledge is "
-        "your own — a candidate answering an interview question."
+        "your own."
     )
 
 
@@ -289,6 +276,36 @@ class KnowledgeConfig:
 
 
 @dataclass(frozen=True)
+class ConversationConfig:
+    """Conversational reasoning engine settings."""
+    # -- Memory --
+    max_memory_turns: int = 10           # Max exchanges to keep in memory
+    short_term_turns: int = 3            # Turns kept verbatim
+    max_memory_chars: int = 6000         # Total memory context budget
+
+    # -- Adaptive pause detection --
+    min_pause_ms: int = 500              # Ignore pauses shorter than this
+    default_pause_ms: int = 1000         # Default trigger threshold
+    max_pause_ms: int = 2000             # Always trigger above this
+
+    # -- Intent classification --
+    respond_to_statements: bool = True   # Respond to non-questions
+    respond_to_incomplete: bool = False  # Respond to trailing thoughts
+    ignore_filler_words: bool = True     # Skip "um", "okay" etc.
+
+    # -- Context switching --
+    topic_drift_threshold: float = 0.4   # Keyword overlap below this = new topic
+
+    # -- Response management --
+    soft_interrupt: bool = True          # Don't hard-cancel in-flight generation
+    interrupt_completion_threshold: float = 0.6  # Let generation finish if >60% done
+
+    # -- Speculative RAG --
+    speculative_rag: bool = True         # Pre-fetch RAG during speech
+    rag_debounce_ms: int = 500           # Min interval between speculative queries
+
+
+@dataclass(frozen=True)
 class AppConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     udp: UdpConfig = field(default_factory=UdpConfig)
@@ -298,6 +315,7 @@ class AppConfig:
     ui: UIConfig = field(default_factory=UIConfig)
     queues: QueueConfig = field(default_factory=QueueConfig)
     knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
+    conversation: ConversationConfig = field(default_factory=ConversationConfig)
 
 
 CONFIG = AppConfig()

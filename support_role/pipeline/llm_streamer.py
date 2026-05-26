@@ -21,7 +21,7 @@ import httpx
 from ..config import CONFIG, LLMConfig
 from ..interview_context import load_interview_context
 from ..llm_settings import LOCAL_SOURCE, LLMSettingsSnapshot, llm_settings
-from .context_buffer import ContextPrompt
+from .conversation_orchestrator import ContextPrompt
 from .session_log import SessionLog
 from .util_queue import LatestWinsQueue
 
@@ -45,14 +45,17 @@ class OllamaStreamer:
         cancel_event: asyncio.Event,
         cfg: LLMConfig = CONFIG.llm,
         session_log: Optional[SessionLog] = None,
+        orchestrator=None,  # ConversationOrchestrator | None
     ) -> None:
         self.prompt_in = prompt_in
         self.hint_out = hint_out
         self.cancel_event = cancel_event
         self.cfg = cfg
         self.session_log = session_log
+        self.orchestrator = orchestrator
         self._client: Optional[httpx.AsyncClient] = None
         self._local_ready = False
+        self.generated_char_count = 0
 
     async def run(self, stop: asyncio.Event) -> None:
         self._client = httpx.AsyncClient(timeout=self.cfg.request_timeout_s)
@@ -200,15 +203,12 @@ class OllamaStreamer:
     async def _stream_ollama(self, prompt: ContextPrompt, stop: asyncio.Event) -> None:
         assert self._client is not None
         await self._ensure_local_ready()
+        self.generated_char_count = 0
         payload = {
             "model": self.cfg.model,
             "stream": True,
             "system": self.cfg.system_prompt,
-            "prompt": _build_user_prompt(
-                prompt.rolling_text,
-                knowledge_block=prompt.knowledge_block,
-                knowledge_hits=prompt.knowledge_hits,
-            ),
+            "prompt": prompt.rolling_text,
             # qwen3 enables chain-of-thought ("<think>...</think>") by
             # default, which destroys realtime latency. Turn it off.
             "think": False,
@@ -227,7 +227,7 @@ class OllamaStreamer:
         log.debug("LLM start seq=%d model=%s", prompt.seq, self.cfg.model)
 
         def _dump(reason: str) -> None:
-            clean = _visible_answer(accumulated, prompt.rolling_text)
+            clean = _visible_answer(accumulated, prompt.utterance_text)
             log.debug(
                 "LLM %s seq=%d in %.0fms (%d chars)",
                 reason, prompt.seq, (time.monotonic() - t0) * 1000, len(clean),
@@ -255,6 +255,12 @@ class OllamaStreamer:
                         return
                     if self.cancel_event.is_set():
                         log.info("LLM cancelled seq=%d (newer input arrived)", prompt.seq)
+                        clean = _visible_answer(accumulated, prompt.utterance_text)
+                        if self.orchestrator is not None and clean:
+                            try:
+                                self.orchestrator.record_response(clean + " [interrupted]")
+                            except Exception:
+                                pass
                         return
                     if not line:
                         continue
@@ -272,7 +278,8 @@ class OllamaStreamer:
                             )
                             first_token_logged = True
                         accumulated += token
-                        clean = _visible_answer(accumulated, prompt.rolling_text)
+                        self.generated_char_count = len(accumulated)
+                        clean = _visible_answer(accumulated, prompt.utterance_text)
                         self.hint_out.put_latest(
                             HintToken(
                                 text=token,
@@ -283,7 +290,7 @@ class OllamaStreamer:
                             )
                         )
                     if done:
-                        clean = _visible_answer(accumulated, prompt.rolling_text)
+                        clean = _visible_answer(accumulated, prompt.utterance_text)
                         self.hint_out.put_latest(
                             HintToken(
                                 text="",
@@ -303,6 +310,11 @@ class OllamaStreamer:
                             log.debug("LLM[%d] | %s", prompt.seq, ln)
                         if self.session_log is not None and clean:
                             self.session_log.log_answer(clean)
+                        if self.orchestrator is not None and clean:
+                            try:
+                                self.orchestrator.record_response(clean)
+                            except Exception:
+                                log.debug("Failed to record response in orchestrator")
                         return
         except httpx.ConnectError as exc:
             log.error(
@@ -323,6 +335,7 @@ class OllamaStreamer:
         if settings.bedrock_api_key:
             os.environ["AWS_BEARER_TOKEN_BEDROCK"] = settings.bedrock_api_key
 
+        self.generated_char_count = 0
         event_q: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
         cancel_thread = threading.Event()
         loop = asyncio.get_running_loop()
@@ -348,6 +361,12 @@ class OllamaStreamer:
             if self.cancel_event.is_set():
                 cancel_thread.set()
                 log.info("LLM cancelled seq=%d (newer input arrived)", prompt.seq)
+                clean = _visible_answer(accumulated, prompt.utterance_text)
+                if self.orchestrator is not None and clean:
+                    try:
+                        self.orchestrator.record_response(clean + " [interrupted]")
+                    except Exception:
+                        pass
                 return
             try:
                 kind, payload = await asyncio.wait_for(event_q.get(), timeout=0.2)
@@ -362,7 +381,8 @@ class OllamaStreamer:
                     )
                     first_token_logged = True
                 accumulated += token
-                clean = _visible_answer(accumulated, prompt.rolling_text)
+                self.generated_char_count = len(accumulated)
+                clean = _visible_answer(accumulated, prompt.utterance_text)
                 self.hint_out.put_latest(
                     HintToken(
                         text=token,
@@ -373,7 +393,7 @@ class OllamaStreamer:
                     )
                 )
             elif kind == "done":
-                clean = _visible_answer(accumulated, prompt.rolling_text)
+                clean = _visible_answer(accumulated, prompt.utterance_text)
                 self._emit_done(prompt, clean, t0)
                 return
             elif kind == "error":
@@ -407,11 +427,7 @@ class OllamaStreamer:
                     "role": "user",
                     "content": [
                         {
-                            "text": _build_user_prompt(
-                                prompt.rolling_text,
-                                knowledge_block=prompt.knowledge_block,
-                                knowledge_hits=prompt.knowledge_hits,
-                            )
+                            "text": prompt.rolling_text
                         }
                     ],
                 }
@@ -450,6 +466,12 @@ class OllamaStreamer:
             log.debug("LLM[%d] | %s", prompt.seq, ln)
         if self.session_log is not None and clean:
             self.session_log.log_answer(clean)
+        # Notify the orchestrator so it can store the response in memory
+        if self.orchestrator is not None and clean:
+            try:
+                self.orchestrator.record_response(clean)
+            except Exception:
+                log.debug("Failed to record response in orchestrator")
 
     def _emit_error(self, prompt: ContextPrompt, message: str) -> None:
         text = f"- {message}"
@@ -541,18 +563,18 @@ def _extract_answer_target(text: str) -> str:
     return t[start:].strip()
 
 
-def _visible_answer(text: str, rolling_text: str) -> str:
+def _visible_answer(text: str, utterance_text: str) -> str:
     clean = _strip_thinking(text).strip()
-    return _strip_leading_transcript_echo(clean, rolling_text).strip()
+    return _strip_leading_transcript_echo(clean, utterance_text).strip()
 
 
-def _strip_leading_transcript_echo(answer: str, rolling_text: str) -> str:
+def _strip_leading_transcript_echo(answer: str, utterance_text: str) -> str:
     """Drop a copied transcript/target line before the real answer."""
     if not answer:
         return ""
-    compact_source = " ".join(rolling_text.strip().split())
+    compact_source = " ".join(utterance_text.strip().split())
     candidates = [
-        _extract_answer_target(rolling_text),
+        _extract_answer_target(utterance_text),
         compact_source,
     ]
     folded_answer = answer.casefold()
