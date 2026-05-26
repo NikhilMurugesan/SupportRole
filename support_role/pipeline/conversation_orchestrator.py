@@ -226,6 +226,8 @@ class ConversationOrchestrator:
 
         # Get the best version of the utterance text
         utterance_text = self._pick_best_utterance_text(update.text)
+        # Deduplicate and preprocess transcript (Rule 2)
+        utterance_text = self.preprocess_and_deduplicate(utterance_text)
         if len(utterance_text.strip()) < 8:
             log.debug(
                 "Orchestrator: skipping very short pause transcript "
@@ -235,6 +237,9 @@ class ConversationOrchestrator:
             self._utterance_partials.clear()
             self._pause_started_at = None
             return
+
+        # Ensure conversation memory contains the cleaned deduplicated utterance
+        self.memory.ingest_raw_text(utterance_text)
 
         # ── adaptive pause evaluation ───────────────────────────────
         silence_ms = (time.monotonic() - self._pause_started_at) * 1000
@@ -269,7 +274,8 @@ class ConversationOrchestrator:
         intent = self.intent_classifier.classify(
             utterance_text, self.memory,
         )
-        should_respond = self.intent_classifier.should_respond(
+        is_trans = self.is_transition(utterance_text)
+        should_respond = is_trans or self.intent_classifier.should_respond(
             intent, utterance_text,
         )
         log.info(
@@ -339,13 +345,31 @@ class ConversationOrchestrator:
             return False
         self._last_sent_text = rolling
 
+        # ── extract active question and feedback ────────────────────────
+        active_question, feedback = self.extract_latest_question_or_instruction(utterance_text)
+        if not active_question:
+            active_question = utterance_text
+            feedback = None
+
+        # ── Check for transition (Rule 8) ──────────────────────────────
+        is_trans = self.is_transition(active_question)
+
+        # ── Check if already answered recently (Rule 5) ───────────────
+        already_answered = False
+        if not is_trans:
+            already_answered = self.is_already_answered(active_question)
+
         # ── RAG decision ────────────────────────────────────────────────
-        should_rag = self._should_retrieve_rag(utterance_text, intent)
+        # Rule 9: Do not use RAG unless the latest question clearly requires it.
+        should_rag = False
+        if not is_trans and not already_answered:
+            should_rag = self._should_retrieve_rag(active_question, utterance_text, intent)
+
         knowledge_block = ""
         knowledge_hits = 0
         if should_rag:
             knowledge_block, knowledge_hits = await self._retrieve_rag(
-                utterance_text,
+                active_question,
             )
         else:
             log.debug("Orchestrator: bypassing RAG retrieval for this turn")
@@ -359,8 +383,25 @@ class ConversationOrchestrator:
         intent_instruction = self.intent_classifier.get_response_instruction(
             intent,
         )
+
+        # Modify instructions for special cases
+        if is_trans:
+            intent_instruction = (
+                "The user wants to move forward (e.g. 'next question', 'let's continue'). "
+                "Briefly acknowledge this in one short sentence or less than 10 words (e.g., 'Sure, let's move on to the next question.') "
+                "and wait/invite their next question. Do NOT repeat, summarize, or reference any previous answer."
+            )
+        elif already_answered:
+            intent_instruction = (
+                "This question has already been answered recently. "
+                "Briefly acknowledge that it was answered (e.g., 'Yes, as mentioned earlier, ...') "
+                "and keep your answer extremely short (under 20 words) without repeating the full details."
+            )
+
         user_prompt = _build_conversational_prompt(
             utterance_text=utterance_text,
+            active_question=active_question,
+            feedback=feedback,
             conversation_context=conversation_context,
             knowledge_block=knowledge_block,
             knowledge_hits=knowledge_hits,
@@ -383,23 +424,24 @@ class ConversationOrchestrator:
                 produced_at=time.monotonic(),
                 knowledge_block=knowledge_block,
                 knowledge_hits=knowledge_hits,
-                utterance_text=utterance_text,
+                utterance_text=active_question,
             ),
         )
 
         log.info(
             "Orchestrator -> LLM (seq=%d, intent=%s, %d chars, "
-            "memory_turns=%d, rag_hits=%d, topic_switch=%s)",
+            "memory_turns=%d, rag_hits=%d, topic_switch=%s, active_question='%s')",
             self._prompt_seq,
             intent.value,
             len(user_prompt),
             self.memory.turn_count,
             knowledge_hits,
             topic_switched,
+            active_question[:50],
         )
         return True
 
-    def _should_retrieve_rag(self, text: str, intent: Intent) -> bool:
+    def _should_retrieve_rag(self, active_question: str, full_text: str, intent: Intent) -> bool:
         """Apply strict rules to decide if we should trigger RAG retrieval."""
         if not self.knowledge_cfg.enabled:
             return False
@@ -408,11 +450,12 @@ class ConversationOrchestrator:
         if intent in (Intent.FILLER, Intent.ACKNOWLEDGEMENT, Intent.INCOMPLETE):
             return False
 
-        cleaned = text.strip().lower()
+        cleaned_active = active_question.strip().lower()
+        cleaned_full = full_text.strip().lower()
 
         # Rule 2: Explicitly check for document or project references
         doc_indicators = {"document", "file", "uploaded", "paper", "pdf", "txt", "docx", "readme", "context", "project", "repo", "repository", "source code"}
-        if any(indicator in cleaned for indicator in doc_indicators):
+        if any(indicator in cleaned_active for indicator in doc_indicators) or any(indicator in cleaned_full for indicator in doc_indicators):
             log.debug("RAG trigger: explicit document/project reference detected")
             return True
 
@@ -424,7 +467,7 @@ class ConversationOrchestrator:
             r"\bgood morning\b", r"\bgood afternoon\b", r"\bgood evening\b",
             r"\bthank you\b", r"\bthanks\b",
         ]
-        if any(re.search(pat, cleaned) for pat in casual_patterns):
+        if any(re.search(pat, cleaned_active) for pat in casual_patterns):
             log.debug("RAG trigger bypassed: casual conversation / introduction")
             return False
 
@@ -441,7 +484,8 @@ class ConversationOrchestrator:
         }
         
         # Tokenize user text into words to check exact matches
-        words = set(re.findall(r"\b\w+\b", cleaned))
+        words_active = set(re.findall(r"\b\w+\b", cleaned_active))
+        words_full = set(re.findall(r"\b\w+\b", cleaned_full))
         
         # Extract keywords from active interview context to see if it matches domain
         interview_context = load_interview_context()
@@ -451,26 +495,27 @@ class ConversationOrchestrator:
             context_words = re.findall(r"\b\w+\b", interview_context.lower())
             domain_keywords = {w for w in context_words if w not in _STOP_WORDS and len(w) > 2}
 
-        # If the user asks about a generic concept:
-        # Only trigger RAG if they ALSO mention a domain-specific keyword from the interview context.
-        has_generic = any(concept in cleaned for concept in generic_concepts)
-        has_domain = any(word in domain_keywords for word in words)
+        # Check generic and domain conditions
+        has_generic_active = any(concept in cleaned_active for concept in generic_concepts)
+        has_domain_active = any(word in domain_keywords for word in words_active)
+        has_domain_full = any(word in domain_keywords for word in words_full)
 
-        if has_generic and not has_domain:
+        # If the active question is generic, only trigger if it contains domain keywords
+        if has_generic_active and not has_domain_active:
             log.debug("RAG trigger bypassed: generic AI/ML/Coding concept query without domain keywords")
             return False
 
-        # If the query has domain-specific keywords from the interview context, run RAG.
-        if has_domain:
+        # If either the active question or the full latest input contains domain keywords, run RAG
+        if has_domain_active or has_domain_full:
             log.debug("RAG trigger: domain keywords from interview context detected")
             return True
 
         # Fallback: if there are no domain keywords and no explicit question, don't run RAG
-        if intent == Intent.STATEMENT and len(cleaned) < 30:
+        if intent == Intent.STATEMENT and len(cleaned_active) < 30:
             return False
 
         # Default to True for other questions to be safe, but only if they contain substantive content
-        return len(cleaned) >= 15
+        return len(cleaned_active) >= 15
 
     # ────────────────────────────────────────────────────── RAG retrieval
 
@@ -551,9 +596,15 @@ class ConversationOrchestrator:
         if len(text.strip()) < 30:
             return
 
+        # Deduplicate and extract active question for partial speech
+        clean_text = self.preprocess_and_deduplicate(text)
+        active_q, _ = self.extract_latest_question_or_instruction(clean_text)
+        if not active_q:
+            active_q = clean_text
+
         # Check if RAG is actually warranted for this partial speech
-        intent = self.intent_classifier.classify(text, self.memory)
-        if not self._should_retrieve_rag(text, intent):
+        intent = self.intent_classifier.classify(active_q, self.memory)
+        if not self._should_retrieve_rag(active_q, text, intent):
             # If not warranted, clean any cached speculative result so we don't use a stale one
             self._speculative_rag_text = ""
             self._speculative_rag_result = ""
@@ -616,6 +667,158 @@ class ConversationOrchestrator:
             return best
         return fallback
 
+    # ── LATEST QUESTION PRIORITY OVERRIDE helpers ───────────────────
+
+    def preprocess_and_deduplicate(self, text: str) -> str:
+        """Clean up repeated words and sentences in the transcript."""
+        if not text:
+            return ""
+        # Remove excessive whitespace
+        text = " ".join(text.split())
+        
+        # 1. Clean up repeated consecutive words (e.g. "what what is is" -> "what is")
+        words = text.split()
+        deduped_words = []
+        for w in words:
+            if len(w) > 1 and deduped_words and w.lower() == deduped_words[-1].lower():
+                continue
+            deduped_words.append(w)
+        cleaned_words_text = " ".join(deduped_words)
+
+        # 2. Clean up repeated sentences/phrases
+        raw_sentences = re.split(r"([.?!])", cleaned_words_text)
+        sentences = []
+        i = 0
+        while i < len(raw_sentences):
+            sent = raw_sentences[i].strip()
+            if not sent:
+                i += 1
+                continue
+            punct = ""
+            if i + 1 < len(raw_sentences) and raw_sentences[i+1] in (".", "?", "!"):
+                punct = raw_sentences[i+1]
+                i += 2
+            else:
+                i += 1
+            sentences.append(sent + punct)
+
+        unique_sentences = []
+        for sent in sentences:
+            sent_clean = re.sub(r"[.?!]", "", sent).strip().lower()
+            if not sent_clean:
+                continue
+            is_dup = False
+            for existing in unique_sentences:
+                ex_clean = re.sub(r"[.?!]", "", existing).strip().lower()
+                if sent_clean == ex_clean:
+                    is_dup = True
+                    break
+                w1 = set(sent_clean.split())
+                w2 = set(ex_clean.split())
+                if w1 and w2:
+                    overlap = len(w1 & w2) / len(w1 | w2)
+                    if overlap > 0.8:
+                        is_dup = True
+                        break
+            if not is_dup:
+                unique_sentences.append(sent)
+
+        return " ".join(unique_sentences)
+
+    def extract_latest_question_or_instruction(self, text: str) -> tuple[Optional[str], Optional[str]]:
+        """Identifies the last complete meaningful question or instruction from text.
+        
+        Returns (active_question_text, remaining_text_as_feedback).
+        """
+        if not text:
+            return None, None
+            
+        # Split text into sentences
+        raw_sentences = re.split(r"([.?!])", text)
+        sentences = []
+        i = 0
+        while i < len(raw_sentences):
+            sent = raw_sentences[i].strip()
+            if not sent:
+                i += 1
+                continue
+            punct = ""
+            if i + 1 < len(raw_sentences) and raw_sentences[i+1] in (".", "?", "!"):
+                punct = raw_sentences[i+1]
+                i += 2
+            else:
+                i += 1
+            sentences.append(sent + punct)
+            
+        question_starters = {
+            "what", "why", "how", "when", "where", "who", "which",
+            "is", "are", "do", "does", "did", "can", "could", "should",
+            "would", "will", "shall", "tell", "explain", "describe", "define",
+            "list", "compare", "show", "give", "summarize", "elaborate", "analyze"
+        }
+        
+        active_idx = -1
+        for idx in range(len(sentences) - 1, -1, -1):
+            sent = sentences[idx].strip()
+            sent_lower = sent.lower()
+            
+            # Check if it's a question or instruction
+            is_q = sent.endswith("?")
+            if not is_q:
+                first_word = sent_lower.split(None, 1)[0].strip(".,!?:;") if sent_lower.split() else ""
+                if first_word in question_starters:
+                    is_q = True
+                    
+            # Must be meaningful (at least 3 words)
+            words = sent_lower.split()
+            if is_q and len(words) >= 3:
+                active_idx = idx
+                break
+                
+        if active_idx != -1:
+            active_question = sentences[active_idx]
+            feedback_parts = sentences[:active_idx]
+            feedback = " ".join(feedback_parts).strip() if feedback_parts else None
+            return active_question, feedback
+            
+        non_empty_sentences = [s for s in sentences if s.strip()]
+        if non_empty_sentences:
+            return non_empty_sentences[-1], " ".join(non_empty_sentences[:-1]).strip() if len(non_empty_sentences) > 1 else None
+            
+        return None, None
+
+    def is_transition(self, text: str) -> bool:
+        """Check if the text represents a transition like 'next question' or 'let's continue'."""
+        cleaned = text.strip().lower().strip(".,!?")
+        transition_phrases = {
+            "next question", "let's continue", "let's try another", "continue", 
+            "move on", "moving on", "let's move on", "try another one",
+            "let us continue", "let us move on"
+        }
+        return cleaned in transition_phrases
+
+    def is_already_answered(self, active_question: str) -> bool:
+        """Check if this active question was already answered recently in memory."""
+        if not self.memory or self.memory.turn_count <= 1:
+            return False
+        # Get last 6 user texts and exclude the current (last) one
+        recent_texts = self.memory.get_recent_user_texts(6)[:-1]
+        active_clean = re.sub(r"[.?!]", "", active_question).strip().lower()
+        for text in recent_texts:
+            text_clean = re.sub(r"[.?!]", "", text).strip().lower()
+            if not text_clean:
+                continue
+            if active_clean == text_clean or active_clean in text_clean or text_clean in active_clean:
+                return True
+            w1 = set(active_clean.split())
+            w2 = set(text_clean.split())
+            if w1 and w2:
+                # Use overlap coefficient (intersection / size of smaller set)
+                overlap = len(w1 & w2) / min(len(w1), len(w2))
+                if overlap > 0.8:
+                    return True
+        return False
+
     # ────────────────────────────────────────────── response recording
 
     def record_response(self, response: str) -> None:
@@ -626,6 +829,11 @@ class ConversationOrchestrator:
 
     async def handle_typed_text(self, text: str) -> None:
         """Handle typed text from the UI directly as a completed utterance."""
+        if not text.strip():
+            return
+
+        # Deduplicate & preprocess (Rule 2)
+        text = self.preprocess_and_deduplicate(text)
         if not text.strip():
             return
 
@@ -719,6 +927,8 @@ class ConversationOrchestrator:
 def _build_conversational_prompt(
     *,
     utterance_text: str,
+    active_question: str,
+    feedback: Optional[str],
     conversation_context: str,
     knowledge_block: str,
     knowledge_hits: int,
@@ -744,8 +954,8 @@ def _build_conversational_prompt(
     # 2. Conversation memory
     if conversation_context:
         parts.append(
-            "Recent conversation history (use for continuity; "
-            "focus on the LATEST utterance):\n"
+            "Recent conversation history (use ONLY for continuity/background; "
+            "never let old context or older questions override the newest active question):\n"
             f"{conversation_context}"
         )
 
@@ -773,14 +983,27 @@ def _build_conversational_prompt(
             "from previous exchanges."
         )
 
-    # 5. Current utterance with intent label
-    intent_label = intent.value.upper().replace("_", " ")
+    # 5. User's full transcript (includes duplicates and feedback)
     parts.append(
-        f"Current utterance (detected as {intent_label}):\n"
+        f"User's full transcript (includes duplicates and feedback):\n"
         f'"""{utterance_text}"""'
     )
 
-    # 6. Intent-specific instruction
+    # 6. Feedback extracted
+    if feedback:
+        parts.append(
+            f"User feedback/continuity context:\n"
+            f'"""{feedback}"""'
+        )
+
+    # 7. Active Question/Instruction (isolated)
+    intent_label = intent.value.upper().replace("_", " ")
+    parts.append(
+        f"LATEST ACTIVE QUESTION/INSTRUCTION (detected as {intent_label} - answer ONLY this, incorporating any feedback above):\n"
+        f'"""{active_question}"""'
+    )
+
+    # 8. Intent-specific instruction
     if intent_instruction:
         parts.append(intent_instruction)
 
