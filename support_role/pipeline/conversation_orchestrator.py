@@ -27,6 +27,7 @@ Responsibilities
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -36,8 +37,11 @@ from typing import Optional
 
 from ..config import CONFIG, ConversationConfig, LLMConfig, KnowledgeConfig
 from ..interview_context import load_interview_context
+from ..knowledge.rag_policy import RagDecision, classify_rag_request
+from ..knowledge.retriever import RetrievalResult
 from .conversation_memory import ConversationMemory
 from .intent_classifier import Intent, IntentClassifier
+from .latest_question import extract_latest_question_or_instruction as _extract_latest_question_or_instruction
 from .pause_detector import AdaptivePauseDetector
 from .context_switch_detector import ContextSwitchDetector
 from .transcriber import TranscriptUpdate
@@ -134,8 +138,10 @@ class ConversationOrchestrator:
 
         # Speculative RAG cache
         self._speculative_rag_text: str = ""
+        self._speculative_rag_signature: tuple[str, tuple[str, ...], tuple[str, ...]] = ("", (), ())
         self._speculative_rag_result: str = ""
         self._speculative_rag_hits: int = 0
+        self._speculative_rag_debug: Optional[RetrievalResult] = None
         self._last_rag_fetch_at: float = 0.0
 
         # Utterance tracking (similar to old _utterance_partials)
@@ -361,18 +367,21 @@ class ConversationOrchestrator:
 
         # ── RAG decision ────────────────────────────────────────────────
         # Rule 9: Do not use RAG unless the latest question clearly requires it.
-        should_rag = False
-        if not is_trans and not already_answered:
-            should_rag = self._should_retrieve_rag(active_question, utterance_text, intent)
+        rag_decision = self._decide_rag(active_question, intent)
+        if is_trans:
+            rag_decision = RagDecision(False, "transition utterance", active_question, (), ("resource_allocation",))
+        elif already_answered:
+            rag_decision = RagDecision(False, "already answered from chat history", active_question, (), ("resource_allocation",))
 
         knowledge_block = ""
         knowledge_hits = 0
-        if should_rag:
-            knowledge_block, knowledge_hits = await self._retrieve_rag(
-                active_question,
+        retrieval_result: Optional[RetrievalResult] = None
+        if rag_decision.rag_required:
+            knowledge_block, knowledge_hits, retrieval_result = await self._retrieve_rag(
+                rag_decision,
             )
         else:
-            log.debug("Orchestrator: bypassing RAG retrieval for this turn")
+            log.debug("Orchestrator: bypassing RAG retrieval for this turn (%s)", rag_decision.rag_reason)
 
         # ── conversation context ────────────────────────────────────────
         conversation_context = self.memory.get_context_window(
@@ -408,7 +417,7 @@ class ConversationOrchestrator:
             intent=intent,
             intent_instruction=intent_instruction,
             topic_switched=topic_switched,
-            include_interview_context=should_rag,
+            include_interview_context="resource_allocation" in rag_decision.allowed_topics,
         )
 
         # ── signal cancellation if soft-interrupt is configured ─────────
@@ -428,6 +437,17 @@ class ConversationOrchestrator:
             ),
         )
 
+        final_answer_source = "rag" if knowledge_hits else (
+            "chat_history" if already_answered else "general_llm"
+        )
+        self._log_rag_debug(
+            latest_detected_question=active_question,
+            decision=rag_decision,
+            retrieval_result=retrieval_result,
+            knowledge_hits=knowledge_hits,
+            final_answer_source=final_answer_source,
+        )
+
         log.info(
             "Orchestrator -> LLM (seq=%d, intent=%s, %d chars, "
             "memory_turns=%d, rag_hits=%d, topic_switch=%s, active_question='%s')",
@@ -441,8 +461,58 @@ class ConversationOrchestrator:
         )
         return True
 
+    def _decide_rag(self, active_question: str, intent: Intent) -> RagDecision:
+        """Decide RAG use from the latest active question only."""
+        return classify_rag_request(
+            active_question,
+            intent_value=intent.value,
+            knowledge_enabled=self.knowledge_cfg.enabled and self.retriever is not None,
+        )
+
+    def _log_rag_debug(
+        self,
+        *,
+        latest_detected_question: str,
+        decision: RagDecision,
+        retrieval_result: Optional[RetrievalResult],
+        knowledge_hits: int,
+        final_answer_source: str,
+    ) -> None:
+        top_results = retrieval_result.debug_top_results() if retrieval_result else []
+        top_similarity = (
+            retrieval_result.top_similarity_score if retrieval_result else 0.0
+        )
+        retrieved_sources = [
+            chunk.source
+            for chunk in (retrieval_result.accepted_chunks if retrieval_result else [])
+        ]
+        accepted_or_rejected = (
+            f"accepted {knowledge_hits} chunk(s)"
+            if knowledge_hits
+            else (
+                retrieval_result.rejected_reason
+                if retrieval_result
+                else "rag not called"
+            )
+        )
+        payload = {
+            "latest_detected_question": latest_detected_question,
+            "rag_required": decision.rag_required,
+            "rag_reason": decision.rag_reason,
+            "retrieval_query": decision.retrieval_query if decision.rag_required else "",
+            "allowed_topics": list(decision.allowed_topics),
+            "blocked_topics": list(decision.blocked_topics),
+            "top_k_results": top_results,
+            "top_similarity_score": round(top_similarity, 4),
+            "retrieved_sources": retrieved_sources,
+            "accepted_or_rejected_context": accepted_or_rejected,
+            "final_answer_source": final_answer_source,
+        }
+        log.info("RAG debug: %s", json.dumps(payload, ensure_ascii=True))
+
     def _should_retrieve_rag(self, active_question: str, full_text: str, intent: Intent) -> bool:
         """Apply strict rules to decide if we should trigger RAG retrieval."""
+        return self._decide_rag(active_question, intent).rag_required
         if not self.knowledge_cfg.enabled:
             return False
 
@@ -519,65 +589,66 @@ class ConversationOrchestrator:
 
     # ────────────────────────────────────────────────────── RAG retrieval
 
-    async def _retrieve_rag(self, text: str) -> tuple[str, int]:
-        """Retrieve RAG context, using speculative cache if fresh enough."""
+    async def _retrieve_rag(self, decision: RagDecision) -> tuple[str, int, Optional[RetrievalResult]]:
+        """Retrieve RAG context, using a topic-aware speculative cache."""
         if self.retriever is None:
-            return "", 0
+            return "", 0, None
 
-        # Use speculative cache if the text hasn't diverged much
+        signature = (
+            decision.retrieval_query,
+            tuple(decision.allowed_topics),
+            tuple(decision.blocked_topics),
+        )
         if (
             self._speculative_rag_result
             and self._speculative_rag_text
-            and _text_similarity(text, self._speculative_rag_text) > 0.6
+            and self._speculative_rag_signature == signature
+            and _text_similarity(decision.retrieval_query, self._speculative_rag_text) > 0.6
         ):
             log.debug(
                 "Orchestrator: using speculative RAG cache "
                 "(%d hits, similarity=%.2f)",
                 self._speculative_rag_hits,
-                _text_similarity(text, self._speculative_rag_text),
+                _text_similarity(decision.retrieval_query, self._speculative_rag_text),
             )
-            return self._speculative_rag_result, self._speculative_rag_hits
+            return self._speculative_rag_result, self._speculative_rag_hits, self._speculative_rag_debug
 
-        return await self._fetch_rag(text)
+        return await self._fetch_rag(decision)
 
-    async def _fetch_rag(self, text: str) -> tuple[str, int]:
-        """Actually call the retriever."""
+    async def _fetch_rag(self, decision: RagDecision) -> tuple[str, int, Optional[RetrievalResult]]:
+        """Actually call the retriever with latest-question-only query text."""
         if self.retriever is None:
-            return "", 0
+            return "", 0, None
 
         t0 = time.monotonic()
         knowledge_block = ""
         knowledge_hits = 0
+        result: Optional[RetrievalResult] = None
         try:
-            interview_context = load_interview_context()
-            retrieval_query = text
-            if interview_context:
-                retrieval_query = (
-                    "Active interview context:\n"
-                    f"{interview_context}\n\n"
-                    "Latest transcript:\n"
-                    f"{text}"
-                )
             loop = asyncio.get_running_loop()
-            chunks = await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 loop.run_in_executor(
-                    None, self.retriever.retrieve, retrieval_query,
+                    None,
+                    lambda: self.retriever.retrieve_with_debug(
+                        decision.retrieval_query,
+                        allowed_topics=decision.allowed_topics,
+                        blocked_topics=decision.blocked_topics,
+                    ),
                 ),
                 timeout=8.0,
             )
-            
-            # --- RAG Confidence Gating ---
-            # Filter chunks based on cosine distance threshold
-            chunks = [c for c in chunks if c.distance < 0.75]
-            
+
+            chunks = result.accepted_chunks
             knowledge_hits = len(chunks)
             if chunks:
                 knowledge_block = self.retriever.format_for_prompt(
                     chunks, self.knowledge_cfg.max_context_chars,
                 )
             log.debug(
-                "RAG retrieve OK in %.0f ms (%d chunks after confidence gating)",
-                (time.monotonic() - t0) * 1000, knowledge_hits,
+                "RAG retrieve OK in %.0f ms (%d accepted chunks, top_similarity=%.3f)",
+                (time.monotonic() - t0) * 1000,
+                knowledge_hits,
+                result.top_similarity_score if result else 0.0,
             )
         except asyncio.TimeoutError:
             log.warning(
@@ -587,7 +658,7 @@ class ConversationOrchestrator:
         except Exception:
             log.exception("RAG retrieval failed")
 
-        return knowledge_block, knowledge_hits
+        return knowledge_block, knowledge_hits, result
 
     async def _maybe_speculative_rag(self, text: str) -> None:
         """Speculatively pre-fetch RAG during speech."""
@@ -602,13 +673,14 @@ class ConversationOrchestrator:
         if not active_q:
             active_q = clean_text
 
-        # Check if RAG is actually warranted for this partial speech
         intent = self.intent_classifier.classify(active_q, self.memory)
-        if not self._should_retrieve_rag(active_q, text, intent):
-            # If not warranted, clean any cached speculative result so we don't use a stale one
+        decision = self._decide_rag(active_q, intent)
+        if not decision.rag_required:
             self._speculative_rag_text = ""
+            self._speculative_rag_signature = ("", (), ())
             self._speculative_rag_result = ""
             self._speculative_rag_hits = 0
+            self._speculative_rag_debug = None
             return
 
         now = time.monotonic()
@@ -618,16 +690,22 @@ class ConversationOrchestrator:
         # Only re-fetch if text has changed significantly
         if (
             self._speculative_rag_text
-            and _text_similarity(text, self._speculative_rag_text) > 0.7
+            and _text_similarity(decision.retrieval_query, self._speculative_rag_text) > 0.7
         ):
             return
 
         self._last_rag_fetch_at = now
         try:
-            block, hits = await self._fetch_rag(text)
-            self._speculative_rag_text = text
+            block, hits, debug = await self._fetch_rag(decision)
+            self._speculative_rag_text = decision.retrieval_query
+            self._speculative_rag_signature = (
+                decision.retrieval_query,
+                tuple(decision.allowed_topics),
+                tuple(decision.blocked_topics),
+            )
             self._speculative_rag_result = block
             self._speculative_rag_hits = hits
+            self._speculative_rag_debug = debug
             log.debug(
                 "Speculative RAG: cached %d hits for %d chars of speech",
                 hits, len(text),
@@ -730,6 +808,7 @@ class ConversationOrchestrator:
         
         Returns (active_question_text, remaining_text_as_feedback).
         """
+        return _extract_latest_question_or_instruction(text)
         if not text:
             return None, None
             

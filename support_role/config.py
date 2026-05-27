@@ -269,7 +269,12 @@ class KnowledgeConfig:
     # Retrieval at query time.
     top_k: int = 3
     # Drop matches with distance above this (Chroma cosine distance, 0=best).
-    max_distance: float = 1.2
+    max_distance: float = 0.48
+    # Equivalent cosine-similarity floor used after retrieval reranking.
+    min_similarity: float = 0.52
+    # Pull a wider candidate set first so topic filters/reranking can reject
+    # unrelated chunks without starving good matches.
+    candidate_multiplier: int = 5
     # If True, the LLM answers from general knowledge when no relevant
     # chunks are found. If False, it must say it doesn't know.
     allow_general_knowledge: bool = True

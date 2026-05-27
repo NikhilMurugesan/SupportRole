@@ -13,6 +13,6 @@ server (model `nomic-embed-text` by default).
 """
 
 from .indexer import DocumentIndexer
-from .retriever import KnowledgeRetriever, RetrievedChunk
+from .retriever import KnowledgeRetriever, RetrievalResult, RetrievedChunk
 
-__all__ = ["DocumentIndexer", "KnowledgeRetriever", "RetrievedChunk"]
+__all__ = ["DocumentIndexer", "KnowledgeRetriever", "RetrievalResult", "RetrievedChunk"]
