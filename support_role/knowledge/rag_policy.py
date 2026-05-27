@@ -11,6 +11,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..pipeline.coding_policy import classify_coding_request
+
 
 RESOURCE_TOPIC = "resource_allocation"
 GTS_TOPIC = "gts_agentic_ai"
@@ -298,6 +300,12 @@ def classify_rag_request(
     has_doc_reference = _contains_any(lower, DOC_REFERENCE_TERMS)
     has_project_reference = _contains_any(lower, PROJECT_REFERENCE_TERMS)
     has_generic = _contains_any(lower, GENERIC_CONCEPT_TERMS)
+    coding_decision = classify_coding_request(question)
+
+    if coding_decision.is_coding and not (
+        coding_decision.project_specific or has_doc_reference or has_project_reference or is_resource or is_gts
+    ):
+        return _no_rag(question, "normal coding question answerable without knowledge base")
 
     if is_resource:
         return RagDecision(
@@ -330,11 +338,19 @@ def classify_rag_request(
         )
 
     if has_project_reference:
+        if coding_decision.is_coding and coding_decision.project_specific:
+            return RagDecision(
+                rag_required=True,
+                rag_reason="project-specific coding request",
+                retrieval_query=question,
+                allowed_topics=tuple(sorted(ALL_TOPICS - RESOURCE_TOPICS)),
+                blocked_topics=(RESOURCE_TOPIC,),
+            )
         return RagDecision(
-            rag_required=False,
-            rag_reason="project reference is ambiguous; no specific project namespace detected",
+            rag_required=True,
+            rag_reason="default user project context requested",
             retrieval_query=question,
-            allowed_topics=(),
+            allowed_topics=tuple(sorted(GTS_RELATED_TOPICS | {INTERVIEW_PREP_TOPIC})),
             blocked_topics=(RESOURCE_TOPIC,),
         )
 

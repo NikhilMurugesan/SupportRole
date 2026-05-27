@@ -40,6 +40,38 @@ class RagPolicyTests(unittest.TestCase):
         self.assertIn(GTS_TOPIC, decision.allowed_topics)
         self.assertIn(RESOURCE_TOPIC, decision.blocked_topics)
 
+    def test_normal_coding_question_does_not_use_rag(self):
+        decision = classify_rag_request(
+            "Solve this DSA problem: find the first non-repeating character in a string."
+        )
+
+        self.assertFalse(decision.rag_required)
+        self.assertIn("coding question", decision.rag_reason)
+
+    def test_project_specific_coding_question_can_use_project_namespace(self):
+        decision = classify_rag_request(
+            "In your resource allocation project, implement the Greedy assignment logic."
+        )
+
+        self.assertTrue(decision.rag_required)
+        self.assertEqual(decision.allowed_topics, (RESOURCE_TOPIC,))
+
+    def test_repo_specific_coding_question_can_use_non_resource_rag(self):
+        decision = classify_rag_request(
+            "In this repo, implement the missing streaming retry logic."
+        )
+
+        self.assertTrue(decision.rag_required)
+        self.assertIn("project-specific coding request", decision.rag_reason)
+        self.assertIn(RESOURCE_TOPIC, decision.blocked_topics)
+
+    def test_ambiguous_project_question_defaults_to_gts_not_resource(self):
+        decision = classify_rag_request("How did you implement your project?")
+
+        self.assertTrue(decision.rag_required)
+        self.assertIn(GTS_TOPIC, decision.allowed_topics)
+        self.assertIn(RESOURCE_TOPIC, decision.blocked_topics)
+
 
 if __name__ == "__main__":
     unittest.main()

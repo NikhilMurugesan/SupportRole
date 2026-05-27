@@ -39,7 +39,13 @@ from ..config import CONFIG, ConversationConfig, LLMConfig, KnowledgeConfig
 from ..interview_context import load_interview_context
 from ..knowledge.rag_policy import RagDecision, classify_rag_request
 from ..knowledge.retriever import RetrievalResult
+from .answer_quality_policy import (
+    AnswerQualityDecision,
+    build_answer_quality_instruction,
+    classify_answer_quality,
+)
 from .conversation_memory import ConversationMemory
+from .coding_policy import CodingDecision, build_coding_instruction, classify_coding_request
 from .intent_classifier import Intent, IntentClassifier
 from .latest_question import extract_latest_question_or_instruction as _extract_latest_question_or_instruction
 from .pause_detector import AdaptivePauseDetector
@@ -356,6 +362,9 @@ class ConversationOrchestrator:
         if not active_question:
             active_question = utterance_text
             feedback = None
+        quality_decision = classify_answer_quality(active_question)
+        active_question = quality_decision.normalized_question
+        coding_decision = classify_coding_request(active_question)
 
         # ── Check for transition (Rule 8) ──────────────────────────────
         is_trans = self.is_transition(active_question)
@@ -403,9 +412,15 @@ class ConversationOrchestrator:
         elif already_answered:
             intent_instruction = (
                 "This question has already been answered recently. "
-                "Briefly acknowledge that it was answered (e.g., 'Yes, as mentioned earlier, ...') "
-                "and keep your answer extremely short (under 20 words) without repeating the full details."
+                "If no new information or new sub-question was added, do not repeat the full answer. "
+                "Give one short acknowledgement that the question was already covered, without using phrases like 'as mentioned earlier'."
             )
+        elif coding_decision.is_coding:
+            intent_instruction = build_coding_instruction(coding_decision)
+
+        answer_quality_instruction = ""
+        if not is_trans and not already_answered and not coding_decision.code_only:
+            answer_quality_instruction = build_answer_quality_instruction(quality_decision)
 
         user_prompt = _build_conversational_prompt(
             utterance_text=utterance_text,
@@ -417,6 +432,9 @@ class ConversationOrchestrator:
             intent=intent,
             intent_instruction=intent_instruction,
             topic_switched=topic_switched,
+            answer_quality_instruction=answer_quality_instruction,
+            quality_decision=quality_decision,
+            coding_decision=coding_decision,
             include_interview_context="resource_allocation" in rag_decision.allowed_topics,
         )
 
@@ -1014,6 +1032,9 @@ def _build_conversational_prompt(
     intent: Intent,
     intent_instruction: str,
     topic_switched: bool,
+    answer_quality_instruction: str = "",
+    quality_decision: Optional[AnswerQualityDecision] = None,
+    coding_decision: Optional[CodingDecision] = None,
     include_interview_context: bool = True,
 ) -> str:
     """Build the full user prompt with all available context."""
@@ -1085,6 +1106,32 @@ def _build_conversational_prompt(
     # 8. Intent-specific instruction
     if intent_instruction:
         parts.append(intent_instruction)
+
+    if answer_quality_instruction:
+        parts.append(answer_quality_instruction)
+
+    if quality_decision is not None:
+        parts.append(
+            "Answer domain metadata:\n"
+            f"- avathon: {quality_decision.is_avathon}\n"
+            f"- asks_company_private_facts: {quality_decision.asks_company_private_facts}\n"
+            f"- project: {quality_decision.is_project}\n"
+            f"- gts_project: {quality_decision.is_gts_project}\n"
+            f"- resource_allocation: {quality_decision.is_resource_allocation}\n"
+            f"- rag: {quality_decision.is_rag}\n"
+            f"- metrics: {quality_decision.is_metrics}\n"
+            f"- architecture: {quality_decision.is_architecture}\n"
+            f"- multi_part: {quality_decision.is_multi_part}"
+        )
+
+    if coding_decision is not None and coding_decision.is_coding:
+        parts.append(
+            "Coding request metadata:\n"
+            f"- language: {coding_decision.language}\n"
+            f"- code_only: {coding_decision.code_only}\n"
+            f"- dsa_or_interview_problem: {coding_decision.is_dsa}\n"
+            f"- project_specific: {coding_decision.project_specific}"
+        )
 
     return "\n\n".join(parts)
 
